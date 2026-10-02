@@ -7,34 +7,29 @@
  * Supports: listing, upload, download, copy, move, delete,
  * public links, trash, disk info, and more.
  *
- * Requires YANDEX_DISK_TOKEN environment variable (OAuth token).
- * Get your token at: https://oauth.yandex.ru
+ * Starts without credentials; call the `login` tool to sign in.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { YandexDiskClient, Resource } from "./yandex-disk-client.js";
+import { loginAndSave, refreshStoredCookie } from "./cookie-source.js";
+import { loadCredentials, saveCredentials } from "./credentials.js";
 import { YandexDiskWebClient, SharedResource } from "./yandex-disk-web-client.js";
 import { openLocalFile, putFile, resolveDestinationPath } from "./local-file.js";
 import { basename } from "node:path";
 
 // ─── Init ───────────────────────────────────────────────
 
-const token = process.env.YANDEX_DISK_TOKEN;
-if (!token) {
-  console.error(
-    "Error: YANDEX_DISK_TOKEN environment variable is required.\n" +
-      "Get your OAuth token at https://oauth.yandex.ru"
-  );
-  process.exit(1);
-}
+// No credentials are required to start: the server starts logged out and the `login`
+// tool signs in (credential store, see credentials.ts; env variables override it)
+const initialCredentials = loadCredentials();
+const client = new YandexDiskClient(initialCredentials.token ?? "");
 
-const client = new YandexDiskClient(token);
-
-// Optional: browser session cookie for the internal web API (shared-with-me list)
-const sessionCookie = process.env.YANDEX_SESSION_COOKIE;
-const webClient = sessionCookie ? new YandexDiskWebClient(sessionCookie) : null;
+// Browser session cookie for the internal web API (shared folders); an expired
+// cookie is refreshed automatically from the saved Chrome profile
+const webClient = new YandexDiskWebClient(initialCredentials.cookie ?? "", refreshStoredCookie);
 
 const server = new McpServer({
   name: "yandex-disk",
@@ -64,6 +59,63 @@ function formatResource(r: Resource): string {
 function textResult(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
+
+// ─── Tool: login ────────────────────────────────────────
+
+server.tool(
+  "login",
+  "Sign in to Yandex: opens a Chrome window (separate profile) where the user logs in to " +
+    "Yandex once; obtains the session cookie (shared folders) and, if an OAuth app client ID " +
+    "is known, the OAuth token (own Disk). Credentials are saved and used immediately. " +
+    "Call this when other tools report that the user is not logged in. Without a Chromium-based " +
+    "browser, pass `token` and/or `cookie` obtained manually instead.",
+  {
+    token: z.string().optional().describe("OAuth token (y0_…) to save as is, no browser needed"),
+    cookie: z
+      .string()
+      .optional()
+      .describe("Cookie header of a disk.yandex.ru request to save as is, no browser needed"),
+    client_id: z
+      .string()
+      .optional()
+      .describe(
+        "Client ID of the OAuth app from https://oauth.yandex.ru (needs cloud_api:disk.* rights, " +
+          "redirect URI https://oauth.yandex.ru/verification_code). Saved for next time."
+      ),
+  },
+  async ({ client_id, token: manualToken, cookie: manualCookie }) => {
+    // Manual mode: credentials were obtained by the user, skip the browser entirely
+    if (manualToken || manualCookie) {
+      saveCredentials({
+        ...(manualToken ? { token: manualToken.trim() } : {}),
+        ...(manualCookie ? { cookie: manualCookie.trim() } : {}),
+        ...(client_id ? { clientId: client_id } : {}),
+      });
+      if (manualToken) client.setToken(manualToken.trim());
+      if (manualCookie) webClient.setCookie(manualCookie.trim());
+      return textResult(
+        `✅ Saved: ${[manualToken && "OAuth token", manualCookie && "session cookie"]
+          .filter(Boolean)
+          .join(" + ")}.`
+      );
+    }
+    try {
+      const { cookie, token, clientId } = await loginAndSave(client_id);
+      webClient.setCookie(cookie);
+      if (token) client.setToken(token);
+      return textResult(
+        "✅ Logged in. Shared folders: available." +
+          (token
+            ? " Own Disk: available."
+            : clientId
+              ? " Own Disk: token was not issued — try login again."
+              : " Own Disk: needs an OAuth app — call login again with client_id.")
+      );
+    } catch (error) {
+      return textResult(`❌ Login failed: ${(error as Error).message}`);
+    }
+  }
+);
 
 // ─── Tool: disk_info ────────────────────────────────────
 
@@ -507,7 +559,7 @@ server.tool(
   "list_shared_with_me",
   "List folders or files shared with the user (the 'Общий доступ' page of Yandex Disk web), " +
     "with owner, access rights and public link. Browse a folder's contents with list_public_folder " +
-    "using its link. Uses the undocumented web API and requires YANDEX_SESSION_COOKIE.",
+    "using its link. Uses the undocumented web API.",
   {
     type: z
       .enum(["folders", "files"])
@@ -555,7 +607,7 @@ const SHARED_PATH_DESCRIPTION =
   "(e.g. 'ADV Team 2/Tasks 2026') or internal path ('/aa/d_…/sub')";
 
 const MISSING_COOKIE_MESSAGE =
-  "❌ YANDEX_SESSION_COOKIE is not set — shared folder operations need the web session cookie.";
+  "❌ Not logged in — call the `login` tool.";
 
 /**
  * Describe the result of an async web operation for the user.
@@ -571,7 +623,7 @@ function operationResult(action: string, state: "done" | "failed" | "in-progress
 server.tool(
   "list_shared_folder",
   "List contents of a folder shared with the user (including subfolders without public links). " +
-    "Requires YANDEX_SESSION_COOKIE.",
+    "Requires a session (see `login`).",
   {
     path: z.string().describe(SHARED_PATH_DESCRIPTION),
     limit: z.number().optional().default(40).describe("Max items (1–40)"),
@@ -591,7 +643,7 @@ server.tool(
 
 server.tool(
   "shared_create_folder",
-  "Create a folder inside a shared folder (needs write rights). Requires YANDEX_SESSION_COOKIE.",
+  "Create a folder inside a shared folder (needs write rights).",
   {
     path: z.string().describe(`${SHARED_PATH_DESCRIPTION} — of the new folder`),
   },
@@ -606,7 +658,7 @@ server.tool(
 server.tool(
   "shared_move",
   "Move or rename a file/folder inside shared folders (needs write rights). " +
-    "'to' is the full new path including the name. Requires YANDEX_SESSION_COOKIE.",
+    "'to' is the full new path including the name.",
   {
     from: z.string().describe(SHARED_PATH_DESCRIPTION),
     to: z.string().describe(`${SHARED_PATH_DESCRIPTION} — full destination path`),
@@ -625,7 +677,7 @@ server.tool(
 server.tool(
   "shared_delete",
   "Delete a file/folder inside a shared folder (moves it to the owner's trash; needs write rights). " +
-    "Requires YANDEX_SESSION_COOKIE.",
+    "Requires a session (see `login`).",
   {
     path: z.string().describe(SHARED_PATH_DESCRIPTION),
   },
@@ -645,7 +697,7 @@ server.tool(
 server.tool(
   "shared_upload_file",
   "Upload a local file into a shared folder (needs write rights). Uses the undocumented " +
-    "web API (mpfs/store). Requires YANDEX_SESSION_COOKIE.",
+    "web API (mpfs/store).",
   {
     local_path: z.string().describe("Absolute path of the local file, e.g. '/Users/me/report.pdf'"),
     path: z
