@@ -7,7 +7,9 @@
  * The API may change without notice.
  */
 
-const WEB_ENTRY_URL = "https://disk.yandex.ru/client/disk";
+import { hashLocalFile, openLocalFile, putFile } from "./local-file.js";
+
+const WEB_ENTRY_URL ="https://disk.yandex.ru/client/disk";
 
 /** Resource shown on the "Общий доступ" page. */
 export interface SharedResource {
@@ -277,6 +279,42 @@ export class YandexDiskWebClient {
   }
 
   /**
+   * Upload a local file to an internal path (e.g. inside a shared folder).
+   * Flow reconstructed from the web client: mpfs/store → PUT to uploadUrl.
+   * If Disk already has identical content (matched by hashes), store answers
+   * "hardlinked" and no upload is needed.
+   * @param localPath - absolute path of the local file
+   * @param path - internal destination path including the file name
+   * @param overwrite - replace an existing file at the destination
+   * @returns "uploaded" or "hardlinked"
+   */
+  async uploadFile(
+    localPath: string,
+    path: string,
+    overwrite: boolean = false
+  ): Promise<"uploaded" | "hardlinked"> {
+    const file = await openLocalFile(localPath);
+    const { md5, sha256 } = await hashLocalFile(localPath);
+    const store = await this.callModel<StoreResponse>("mpfs/store", {
+      path,
+      force: overwrite ? 1 : 0,
+      size: file.size,
+      md5,
+      sha256,
+    });
+    if (store.status === "hardlinked") {
+      return "hardlinked";
+    }
+    // Field name differs between web client versions
+    const uploadUrl = store.uploadUrl ?? store.upload_url;
+    if (!uploadUrl) {
+      throw new Error(`mpfs/store returned no upload URL (status: ${store.status ?? "unknown"})`);
+    }
+    await putFile(uploadUrl, file);
+    return "uploaded";
+  }
+
+  /**
    * Poll an async operation until it finishes or the timeout expires.
    * @param oid - operation ID from moveResource / deleteResource
    * @param timeoutMs - how long to wait before giving up
@@ -308,6 +346,14 @@ export class YandexDiskWebClient {
 interface BulkOperation {
   oid: string;
   type: string;
+}
+
+/** Response of mpfs/store (upload preparation). */
+interface StoreResponse {
+  status?: string;
+  uploadUrl?: string;
+  upload_url?: string;
+  oid?: string;
 }
 
 /** Status entry returned by mpfs/bulk-operation-status. */
