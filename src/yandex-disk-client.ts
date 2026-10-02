@@ -4,6 +4,7 @@
  */
 
 const API_BASE = "https://cloud-api.yandex.net/v1/disk";
+const API_360_BASE = "https://api360.yandex.net/directory/v1";
 
 export interface DiskInfo {
   total_space: number;
@@ -37,6 +38,23 @@ export interface Link {
   templated: boolean;
 }
 
+/** Shared disk (virtual disk) of a Yandex 360 for Business organization. */
+export interface SharedDisk {
+  name: string;
+  resource_id: string;
+  vd_hash: string;
+  total_space: number;
+  used_space: number;
+  trash_size: number;
+  permissions: string[];
+}
+
+/** Yandex 360 for Business organization. */
+export interface Organization {
+  id: number;
+  name: string;
+}
+
 export interface OperationStatus {
   status: "success" | "failure" | "in-progress";
 }
@@ -57,7 +75,8 @@ export class YandexDiskClient {
     } = {}
   ): Promise<T> {
     const { method = "GET", params, body } = options;
-    const url = new URL(`${API_BASE}${path}`);
+    // Absolute URLs (e.g. Yandex 360 API) are used as is, relative ones go to Disk API
+    const url = new URL(path.startsWith("https://") ? path : `${API_BASE}${path}`);
     if (params) {
       Object.entries(params).forEach(([key, value]) => {
         if (value !== undefined && value !== "") {
@@ -89,8 +108,9 @@ export class YandexDiskClient {
       } catch {
         errorMessage = errorBody;
       }
+      // Yandex 360 API returns errors as { code, message }
       throw new Error(
-        `Yandex Disk API error ${response.status}: ${errorMessage}`
+        `Yandex API error ${response.status}: ${errorMessage}`
       );
     }
 
@@ -200,6 +220,36 @@ export class YandexDiskClient {
     return this.request<{ items: Resource[]; total: number }>("/resources/public", { params });
   }
 
+  /**
+   * Get metadata (and folder contents) of a resource by its public link or key.
+   * API: GET /v1/disk/public/resources
+   * @param publicKey - public URL (https://yadi.sk/d/...) or public key/hash
+   * @param options - relative path inside the public folder and pagination
+   */
+  async getPublicResource(
+    publicKey: string,
+    options?: { path?: string; limit?: number; offset?: number; sort?: string }
+  ): Promise<Resource> {
+    const params: Record<string, string> = { public_key: publicKey };
+    if (options?.path) params.path = options.path;
+    if (options?.limit) params.limit = String(options.limit);
+    if (options?.offset) params.offset = String(options.offset);
+    if (options?.sort) params.sort = options.sort;
+    return this.request<Resource>("/public/resources", { params });
+  }
+
+  /**
+   * Get a download link for a resource inside a public folder.
+   * API: GET /v1/disk/public/resources/download
+   * @param publicKey - public URL or key of the shared resource
+   * @param path - relative path inside the public folder (optional for files)
+   */
+  async getPublicDownloadLink(publicKey: string, path?: string): Promise<Link> {
+    const params: Record<string, string> = { public_key: publicKey };
+    if (path) params.path = path;
+    return this.request<Link>("/public/resources/download", { params });
+  }
+
   // ─── Trash ────────────────────────────────────────────
 
   async getTrash(
@@ -251,6 +301,42 @@ export class YandexDiskClient {
     if (options?.limit) params.limit = String(options.limit);
     if (options?.media_type) params.media_type = options.media_type;
     return this.request<{ items: Resource[] }>("/resources/last-uploaded", { params });
+  }
+
+  // ─── Shared Disks (Yandex 360) ────────────────────────
+
+  /**
+   * List organization shared disks available to the current user.
+   * API: GET /v1/disk/virtual-disks/discovery
+   * @param orgId - Yandex 360 for Business organization ID
+   * @param options - pagination (limit 1–100, offset)
+   * @returns shared disks with the user's permissions on each
+   */
+  async getSharedDisks(
+    orgId: string,
+    options?: { limit?: number; offset?: number }
+  ): Promise<{ items: SharedDisk[]; total: number; limit: number; offset: number }> {
+    const params: Record<string, string> = { org_id: orgId };
+    if (options?.limit) params.limit = String(options.limit);
+    if (options?.offset) params.offset = String(options.offset);
+    return this.request<{ items: SharedDisk[]; total: number; limit: number; offset: number }>(
+      "/virtual-disks/discovery",
+      { params }
+    );
+  }
+
+  /**
+   * List Yandex 360 organizations available to the token.
+   * API: GET https://api360.yandex.net/directory/v1/org
+   * Requires the `directory:read_organization` OAuth scope.
+   * @returns organizations the user belongs to
+   */
+  async getOrganizations(): Promise<Organization[]> {
+    const result = await this.request<{ organizations?: Organization[] }>(
+      `${API_360_BASE}/org`,
+      { params: { pageSize: "100" } }
+    );
+    return result.organizations ?? [];
   }
 
   // ─── Operations ───────────────────────────────────────
