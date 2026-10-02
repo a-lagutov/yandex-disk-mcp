@@ -660,8 +660,8 @@ async function formatSearchHit(resource: SharedResource): Promise<string> {
 server.tool(
   "shared_search",
   "Search files and folders shared with the user by name (all shared folders at once, or one " +
-    "shared folder). Requires a session (see `login`). Next page: pass `iteration_key` from the " +
-    "previous answer.",
+    "shared folder or subfolder). Requires a session (see `login`). A call stops after about 30 s: " +
+    "pass `iteration_key` from the answer to continue (the folder is remembered).",
   {
     query: z.string().describe("Text to look for in names"),
     folder: z
@@ -673,17 +673,14 @@ server.tool(
   },
   async ({ query, folder, limit, iteration_key }) => {
     if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
-    const { resources, iterationKey, truncated } = await webClient.searchShared(query, {
+    const { resources, iterationKey } = await webClient.searchShared(query, {
       folder,
       limit,
       iterationKey: iteration_key,
     });
-    const truncatedNote = truncated
-      ? ["", "⚠️ Folder is large: the walk stopped early. Search in a subfolder, or without `folder` (server search, continue with iteration_key)."]
-      : [];
     if (resources.length === 0) {
       return textResult(
-        `Nothing found for "${query}"` + (truncated ? " (walk stopped early — try a subfolder or search without `folder`)" : "") +
+        `Nothing found for "${query}"` +
           (iterationKey
             ? ` yet — search is slow, not finished. Continue: iteration_key=${iterationKey}`
             : ".")
@@ -692,7 +689,7 @@ server.tool(
     const lines = await Promise.all(resources.map(formatSearchHit));
     const footer = iterationKey ? ["", `More: iteration_key=${iterationKey}`] : [];
     return textResult(
-      [`🔎 "${query}"${folder ? ` in ${folder}` : ""} (showing ${lines.length}):`, "", ...lines, ...footer, ...truncatedNote].join("\n")
+      [`🔎 "${query}"${folder ? ` in ${folder}` : ""} (showing ${lines.length}):`, "", ...lines, ...footer].join("\n")
     );
   }
 );
