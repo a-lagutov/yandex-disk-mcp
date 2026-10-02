@@ -15,6 +15,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { YandexDiskClient, Resource } from "./yandex-disk-client.js";
 import { loginAndSave, refreshStoredCookie } from "./cookie-source.js";
+import { IndexSync } from "./index-sync.js";
+import { SharedIndex } from "./shared-index.js";
 import { loadCredentials, saveCredentials } from "./credentials.js";
 import { YandexDiskWebClient, SharedResource } from "./yandex-disk-web-client.js";
 import { openLocalFile, putFile, resolveDestinationPath } from "./local-file.js";
@@ -30,6 +32,8 @@ const client = new YandexDiskClient(initialCredentials.token ?? "");
 // Browser session cookie for the internal web API (shared folders); an expired
 // cookie is refreshed automatically from the saved Chrome profile
 const webClient = new YandexDiskWebClient(initialCredentials.cookie ?? "", refreshStoredCookie);
+const sharedIndex = new SharedIndex(webClient);
+const indexSync = new IndexSync(client, sharedIndex);
 
 const server = new McpServer({
   name: "yandex-disk",
@@ -691,10 +695,38 @@ server.tool(
         "Keep only items whose name contains the query (case-insensitive); the server search is " +
           "fuzzy and also returns similar words and items matched by path"
       ),
+    live: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Skip the local index of `folder` (see index_shared) and search the server"),
     iteration_key: z.string().optional().describe("Continuation key from the previous answer"),
   },
-  async ({ query, folder, limit, exact, iteration_key }) => {
+  async ({ query, folder, limit, exact, live, iteration_key }) => {
     if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    // A finished local index of the folder answers in milliseconds, without fuzzy noise
+    if (folder && !live) {
+      // First use per process: fetch indexes built elsewhere from the user's Disk
+      await indexSync.ensureStartupSync();
+      const folderPath = await webClient.resolvePath(folder);
+      const indexed = sharedIndex.findCovering(folderPath);
+      if (indexed) {
+        const offset = iteration_key?.startsWith("idx:") ? Number(iteration_key.slice(4)) : 0;
+        const { resources, nextOffset } = sharedIndex.search(indexed, folderPath, query, limit, offset);
+        if (resources.length === 0) {
+          return textResult(`Nothing found for "${query}" in the index of ${folder} (built ${indexed.file.builtAt}).`);
+        }
+        const indexedLines = await Promise.all(resources.map(formatSearchHit));
+        return textResult(
+          [
+            `🔎 "${query}" in ${folder} — local index, built ${indexed.file.builtAt} (showing ${indexedLines.length}):`,
+            "",
+            ...indexedLines,
+            ...(nextOffset !== null ? ["", `More: iteration_key=idx:${nextOffset}`] : []),
+          ].join("\n")
+        );
+      }
+    }
     const { resources, iterationKey } = await webClient.searchShared(query, {
       folder,
       limit,
@@ -715,6 +747,41 @@ server.tool(
       [`🔎 "${query}"${folder ? ` in ${folder}` : ""} (showing ${lines.length}):`, "", ...lines, ...footer].join("\n")
     );
   }
+);
+
+server.tool(
+  "index_shared",
+  "Build a local name index of a shared folder (its whole tree) in the background. Afterwards " +
+    "shared_search with that folder is instant, ignores punctuation and case (\"prod9514\" finds " +
+    "\"PROD-9514\") and has no fuzzy noise. Takes minutes for big trees; progress in index_status. " +
+    "The index is a snapshot: rebuild with refresh=true. An interrupted build is resumed.",
+  {
+    folder: z.string().describe(SHARED_PATH_DESCRIPTION),
+    refresh: z.boolean().optional().default(false).describe("Rebuild from scratch"),
+  },
+  async ({ folder, refresh }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    // Sync first: an index built elsewhere is pulled instead of walking the tree again
+    await indexSync.ensureStartupSync();
+    return textResult(await sharedIndex.startBuild(folder, refresh));
+  }
+);
+
+server.tool(
+  "index_sync",
+  "Sync local shared-folder indexes with your own Yandex Disk (disk:/.yandex-disk-mcp/index). " +
+    "Newer wins, the other copy is kept as .bak. Runs automatically before a build, on the first " +
+    "indexed search and after a build; call it to sync on demand. Needs the OAuth token. " +
+    "Disable with YANDEX_INDEX_SYNC=off.",
+  {},
+  async () => textResult(await indexSync.syncAll())
+);
+
+server.tool(
+  "index_status",
+  "Show running index builds (progress) and the saved local indexes of shared folders.",
+  {},
+  async () => textResult(`${sharedIndex.describe()}\n${indexSync.describe()}`)
 );
 
 server.tool(
