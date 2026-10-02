@@ -6,7 +6,7 @@ MCP server for Yandex Disk: your own files, public links, trash, **shared folder
 
 Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 
-## Tools (32)
+## Tools (35)
 
 ### Login
 
@@ -54,6 +54,9 @@ Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 | `shared_copy` | Copy (same destination rules as `shared_move`) |
 | `shared_delete` | Delete (to the owner's trash). A shared folder root cannot be deleted |
 | `shared_upload_file` | Upload a local file |
+| `index_shared` | Build a local name index of a shared folder's whole tree in the background (minutes for big trees). Afterwards `shared_search` with that folder answers instantly, ignoring case and punctuation (`prod9514` finds `PROD-9514`) |
+| `index_status` | Running builds and saved indexes, Disk sync state |
+| `index_sync` | Sync indexes with your own Disk now (runs by itself too, see Limitations) |
 
 ### Yandex 360 for business
 
@@ -114,6 +117,7 @@ They override the saved values — for example in Docker/CI, where there is no b
 | `YANDEX_CLIENT_ID` | OAuth app Client ID |
 | `YANDEX_ORG_ID` | Yandex 360 organization ID for `list_shared_disks` |
 | `YANDEX_CHROME_PATH` | Path to a Chromium-based browser if it is in a non-standard place |
+| `YANDEX_INDEX_SYNC` | `off` disables syncing indexes to your Disk |
 
 > ⚠️ A variable **overrides** the saved value. A stale `YANDEX_DISK_TOKEN` or `YANDEX_SESSION_COOKIE` in the environment gives 401 even after a successful `login` — remove it (`unset`, edit `~/.zshenv`, etc.).
 
@@ -191,6 +195,7 @@ The public REST API does not return the "Shared" list and cannot write to other 
 
 - Search (`shared_search`, `search_files` with `query`) is the web client's own search and is slow on Yandex's side: 2–11 s per page of 20. A query in double quotes (`"PROD-9514"`) searches whole words only: pages take ~0.5 s instead of 2–10 s and carry no noise, but names that merely start with the query (`PROD-9514_out`) are missed. Several pages are fetched in parallel; one call stops after about 30 s and returns an `iteration_key` to continue.
 - The server cannot limit the search to one shared folder, so with `folder` the tree is walked with fast folder listings (about 16 folders per second, found by name substring). Huge trees (thousands of folders) do not fit into one call: the answer carries an `iteration_key` — pass it back to continue where the walk stopped (the folder is remembered; kept in server memory for 30 minutes). Narrowing `folder` to a subfolder is much faster.
+- Indexes (`index_shared`) are snapshots: rebuild with `refresh=true` to see newer changes. Each index is also kept on **your own Disk** as `disk:/.yandex-disk-mcp/index/<id>.json.gz` (needs the OAuth token; never published or shared), so another machine pulls it instead of walking the tree. Sync runs first — before a build and on the first indexed search — and again after a build; the newer index wins and the other copy is kept as `.bak`. Unfinished builds are never uploaded. `YANDEX_INDEX_SYNC=off` turns it off.
 - Writing to a read-only shared folder — the error format is not verified.
 - `list_shared_folder` returns up to 40 items per request — use `offset` for more.
 - Move/delete waits up to 15 s; for large folders it returns "in progress" and the operation continues on Yandex's side.

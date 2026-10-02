@@ -490,7 +490,7 @@ export class YandexDiskWebClient {
    * One page of a folder listing together with the raw page size (the folder itself
    * can come back as an extra item, so the item count alone cannot tell the last page).
    */
-  private async listFolderPage(
+  async listFolderPage(
     path: string,
     options?: { amount?: number; offset?: number }
   ): Promise<{ items: SharedResource[]; rawCount: number }> {
