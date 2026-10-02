@@ -2,7 +2,7 @@
 
 MCP-сервер для управления файлами на Яндекс Диске. Работает с любым MCP-клиентом: Claude Desktop, Claude Code, Cursor, и др.
 
-## Возможности (18 инструментов)
+## Возможности (23 инструмента)
 
 | Инструмент | Описание |
 |---|---|
@@ -24,6 +24,10 @@ MCP-сервер для управления файлами на Яндекс Д
 | `clear_trash` | Очистить корзину |
 | `search_files` | Поиск/фильтрация файлов по типу |
 | `last_uploaded` | Недавно загруженные файлы |
+| `list_shared_with_me` | Папки/файлы, к которым вам дали доступ (раздел «Общий доступ»): владелец, права, ссылка. Нужен `YANDEX_SESSION_COOKIE` |
+| `list_public_folder` | Содержимое общей/публичной папки по ссылке или ключу |
+| `get_public_download_link` | Ссылка на скачивание файла из общей/публичной папки |
+| `list_shared_disks` | Общие диски организации Яндекс 360, доступные пользователю, и права на них (организация определяется автоматически, нужно право `directory:read_organization`; либо `org_id` / `YANDEX_ORG_ID`) |
 | `operation_status` | Статус асинхронной операции |
 
 ## Установка
@@ -46,6 +50,8 @@ npm run build
    - `cloud_api:disk.read` — чтение
    - `cloud_api:disk.write` — запись
    - `cloud_api:disk.info` — информация о диске
+   В разделе **API Яндекс 360** (необязательно, для `list_shared_disks`):
+   - `directory:read_organization` — определение организации для общих дисков
 6. Сохраните приложение и скопируйте **Client ID**
 7. Откройте в браузере:
    ```
@@ -66,12 +72,24 @@ npm run build
       "command": "node",
       "args": ["/path/to/yandex-disk-mcp/dist/index.js"],
       "env": {
-        "YANDEX_DISK_TOKEN": "ваш_oauth_токен"
+        "YANDEX_DISK_TOKEN": "ваш_oauth_токен",
+        "YANDEX_ORG_ID": "id_организации_яндекс_360 (необязательно)",
+        "YANDEX_SESSION_COOKIE": "cookie сессии disk.yandex.ru (необязательно, для list_shared_with_me)"
       }
     }
   }
 }
 ```
+
+> Список «Общий доступ» публичный REST API не отдаёт. `list_shared_with_me` берёт его из
+> **недокументированного** API веб-версии Диска (`models-v2?m=mpfs/resources`) по cookie сессии браузера,
+> поэтому может сломаться при изменениях на стороне Яндекса. Содержимое папок (`list_public_folder`)
+> и скачивание идут через официальный API.
+>
+> Как получить `YANDEX_SESSION_COOKIE`: откройте disk.yandex.ru → DevTools → Network → любой запрос
+> к `models-v2` → Request Headers → скопируйте значение `Cookie` целиком. Cookie даёт полный доступ
+> к аккаунту — храните её только в конфиге MCP-клиента, не в репозитории. При истечении сессии
+> инструмент вернёт ошибку — обновите cookie.
 
 ### Cursor / другие MCP-клиенты
 
