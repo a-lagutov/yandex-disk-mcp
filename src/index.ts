@@ -16,6 +16,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { YandexDiskClient, Resource } from "./yandex-disk-client.js";
 import { YandexDiskWebClient, SharedResource } from "./yandex-disk-web-client.js";
+import { openLocalFile, putFile, resolveDestinationPath } from "./local-file.js";
+import { basename } from "node:path";
 
 // ─── Init ───────────────────────────────────────────────
 
@@ -233,6 +235,27 @@ server.tool(
     return textResult(
       `⬆️ Upload URL for ${path}:\n${link.href}\n\nUse HTTP PUT with file content to this URL.`
     );
+  }
+);
+
+// ─── Tool: upload_file ──────────────────────────────────
+
+server.tool(
+  "upload_file",
+  "Upload a local file to your Yandex Disk (official API: upload link + PUT)",
+  {
+    local_path: z.string().describe("Absolute path of the local file, e.g. '/Users/me/report.pdf'"),
+    path: z
+      .string()
+      .describe("Destination on disk, e.g. 'disk:/uploads/report.pdf'. Ending with '/' keeps the local file name"),
+    overwrite: z.boolean().optional().default(false).describe("Overwrite if exists"),
+  },
+  async ({ local_path, path, overwrite }) => {
+    const file = await openLocalFile(local_path);
+    const destination = resolveDestinationPath(path, file.name);
+    const link = await client.getUploadLink(destination, overwrite);
+    await putFile(link.href, file);
+    return textResult(`⬆️ Uploaded: ${local_path} → ${destination} (${formatSize(file.size)})`);
   }
 );
 
@@ -616,6 +639,29 @@ server.tool(
     const oid = await webClient.deleteResource(internalPath);
     const state = await webClient.waitForOperation(oid);
     return operationResult(`Moved to trash: ${path}`, state);
+  }
+);
+
+server.tool(
+  "shared_upload_file",
+  "Upload a local file into a shared folder (needs write rights). Uses the undocumented " +
+    "web API (mpfs/store). Requires YANDEX_SESSION_COOKIE.",
+  {
+    local_path: z.string().describe("Absolute path of the local file, e.g. '/Users/me/report.pdf'"),
+    path: z
+      .string()
+      .describe(
+        `${SHARED_PATH_DESCRIPTION} — destination. Ending with '/' keeps the local file name`
+      ),
+    overwrite: z.boolean().optional().default(false).describe("Overwrite if exists"),
+  },
+  async ({ local_path, path, overwrite }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const destination = resolveDestinationPath(path, basename(local_path));
+    const internalPath = await webClient.resolvePath(destination);
+    const result = await webClient.uploadFile(local_path, internalPath, overwrite);
+    const note = result === "hardlinked" ? " (identical content already on Disk, linked instantly)" : "";
+    return textResult(`⬆️ Uploaded: ${local_path} → ${destination}${note}`);
   }
 );
 
