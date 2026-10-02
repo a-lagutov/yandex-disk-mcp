@@ -4,3 +4,5 @@ services:
     stdin_open: true
     environment:
       - YANDEX_DISK_TOKEN=${YANDEX_DISK_TOKEN}
+      - YANDEX_SESSION_COOKIE=${YANDEX_SESSION_COOKIE:-}
+      - YANDEX_ORG_ID=${YANDEX_ORG_ID:-}
