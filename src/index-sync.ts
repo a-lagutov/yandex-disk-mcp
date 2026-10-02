@@ -173,19 +173,19 @@ export class IndexSync {
     // Remote unchanged since our last sync: only a newer local build needs a push
     const known = this.state[id];
     if (known && remoteMd5 && known.remoteMd5 === remoteMd5) {
-      return local.builtAt && local.builtAt > known.builtAt
+      return local.version && local.version > known.builtAt
         ? this.push(id, local.root, label)
         : `= ${label}: up to date`;
     }
 
     // Remote changed (or never synced): compare build times
     const remoteFile = await this.download(remotePath);
-    if (!local.builtAt || (remoteFile.builtAt ?? "") > local.builtAt) {
+    if (!local.version || (remoteFile.updatedAt ?? remoteFile.builtAt ?? "") > (local.version ?? "")) {
       this.keepBackup(local.root);
       return this.install(id, remoteFile, remoteMd5, `⬇️ ${label}: pulled newer index from the Disk`);
     }
-    if (remoteFile.builtAt === local.builtAt) {
-      this.state[id] = { remoteMd5, builtAt: local.builtAt };
+    if ((remoteFile.updatedAt ?? remoteFile.builtAt) === local.version) {
+      this.state[id] = { remoteMd5, builtAt: local.version! };
       this.saveState();
       return `= ${label}: already identical`;
     }
@@ -212,7 +212,7 @@ export class IndexSync {
   /** Put a downloaded index in place and remember the sync point. */
   private install(id: string, file: IndexFile, remoteMd5: string | undefined, message: string): string {
     this.sharedIndex.importIndexText(JSON.stringify(file));
-    this.state[id] = { remoteMd5, builtAt: file.builtAt ?? "" };
+    this.state[id] = { remoteMd5, builtAt: file.updatedAt ?? file.builtAt ?? "" };
     this.saveState();
     return message;
   }
@@ -236,8 +236,8 @@ export class IndexSync {
   private async push(id: string, root: string, label: string): Promise<string> {
     const text = this.sharedIndex.readIndexText(root);
     if (!text) throw new Error("local index file is missing");
-    const builtAt = (JSON.parse(text) as IndexFile).builtAt;
-    if (!builtAt) return `· ${label}: unfinished, not pushed`;
+    const parsed = JSON.parse(text) as IndexFile;
+    if (!parsed.builtAt) return `· ${label}: unfinished, not pushed`;
     await this.ensureRemoteFolders();
 
     const temporaryPath = join(INDEX_DIR, `${id}.json.gz.upload`);
@@ -252,7 +252,7 @@ export class IndexSync {
         .getResource(remotePath)
         .then((resource) => resource.md5)
         .catch(() => undefined);
-      this.state[id] = { remoteMd5, builtAt };
+      this.state[id] = { remoteMd5, builtAt: parsed.updatedAt ?? parsed.builtAt };
       this.saveState();
       return `⬆️ ${label}: pushed to the Disk`;
     } finally {
