@@ -76,7 +76,9 @@ npm run build
 
 Дальше всё автоматически: cookie общих папок, когда протухнет, обновляется в фоне из сохранённого профиля. Если сессия профиля тоже истекла — инструменты попросят снова вызвать `login`.
 
-Работает на любой ОС и в любой оболочке (zsh не нужен). Требуется Google Chrome и Node.js ≥ 22. То же без Claude: `npm run login`.
+Работает на любой ОС и в любой оболочке (zsh не нужен). Нужен любой браузер на Chromium: Chrome, Edge, Яндекс.Браузер, Brave, Vivaldi, Chromium (путь можно задать в `YANDEX_CHROME_PATH`), и Node.js ≥ 22. То же без Claude: `npm run login`.
+
+**Без такого браузера** (Firefox, Safari) войдите вручную: откройте `https://oauth.yandex.ru/authorize?response_type=token&client_id=<CLIENT_ID>` в любом браузере и скопируйте `access_token` из адресной строки; cookie — заголовок `Cookie` любого запроса `models-v2` на disk.yandex.ru (DevTools → Network). Передайте их в `login` (`token`, `cookie`) или `npm run login -- --token <T> --cookie <C>`. Автообновление cookie в этом режиме не работает.
 
 ### OAuth-приложение (один раз)
 
@@ -100,7 +102,7 @@ npm run build
 | `YANDEX_SESSION_COOKIE` | Cookie сессии браузера (заголовок `Cookie` запроса `models-v2` на disk.yandex.ru) |
 | `YANDEX_CLIENT_ID` | Client ID OAuth-приложения |
 | `YANDEX_ORG_ID` | ID организации Яндекс 360 для `list_shared_disks` |
-| `YANDEX_CHROME_PATH` | Путь к Chrome, если он в нестандартном месте |
+| `YANDEX_CHROME_PATH` | Путь к браузеру на Chromium, если он в нестандартном месте |
 
 ## Подключение
 

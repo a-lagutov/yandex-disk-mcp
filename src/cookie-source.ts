@@ -14,15 +14,40 @@ import { CONFIG_DIR, loadCredentials, saveCredentials } from "./credentials.js";
 
 const PROFILE_DIR = join(CONFIG_DIR, "chrome-profile");
 
-/** Usual Chrome/Chromium install locations per platform. */
-const CHROME_CANDIDATES = [
+/**
+ * Chromium-based browsers share the DevTools protocol, so any of them works.
+ * Order: Chrome first, then Edge (preinstalled on Windows), Yandex Browser, others.
+ */
+const BROWSER_CANDIDATES = [
+  // macOS
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+  "/Applications/Yandex.app/Contents/MacOS/Yandex",
+  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+  "/Applications/Vivaldi.app/Contents/MacOS/Vivaldi",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  // Linux
   "/usr/bin/google-chrome",
   "/usr/bin/google-chrome-stable",
+  "/usr/bin/microsoft-edge",
+  "/usr/bin/yandex-browser",
+  "/usr/bin/brave-browser",
+  "/usr/bin/vivaldi",
   "/usr/bin/chromium",
   "/usr/bin/chromium-browser",
-  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-  "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+  "/snap/bin/chromium",
+  // Windows (per-machine and per-user installs)
+  ...["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"].flatMap((variable) => {
+    const root = process.env[variable];
+    return root
+      ? [
+          `${root}\\Google\\Chrome\\Application\\chrome.exe`,
+          `${root}\\Microsoft\\Edge\\Application\\msedge.exe`,
+          `${root}\\Yandex\\YandexBrowser\\Application\\browser.exe`,
+          `${root}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe`,
+        ]
+      : [];
+  }),
 ];
 const DISK_URL = "https://disk.yandex.ru/client/disk";
 const OAUTH_AUTHORIZE_URL = "https://oauth.yandex.ru/authorize?response_type=token&client_id=";
@@ -31,15 +56,21 @@ const HEADLESS_TIMEOUT_MS = 30_000;
 const INTERACTIVE_TIMEOUT_MS = 5 * 60_000;
 const POLL_INTERVAL_MS = 1_000;
 
-/** Find Chrome: YANDEX_CHROME_PATH first, then the usual locations. */
+/** Find a Chromium-based browser: YANDEX_CHROME_PATH first, then the usual locations. */
 function findChromeBinary(): string {
-  const chromePath = [process.env.YANDEX_CHROME_PATH, ...CHROME_CANDIDATES].find(
+  const browserPath = [process.env.YANDEX_CHROME_PATH, ...BROWSER_CANDIDATES].find(
     (candidate) => candidate && existsSync(candidate)
   );
-  if (!chromePath) {
-    throw new Error("Google Chrome not found — install it or set YANDEX_CHROME_PATH");
+  if (!browserPath) {
+    throw new Error(
+      "No Chromium-based browser found (Chrome, Edge, Yandex Browser, Brave, Vivaldi, Chromium). " +
+        "Install one or set YANDEX_CHROME_PATH. Or log in manually: call `login` with " +
+        "`token` (open https://oauth.yandex.ru/authorize?response_type=token&client_id=<CLIENT_ID> " +
+        "in any browser and copy access_token from the address bar) and `cookie` (Cookie header of " +
+        "any disk.yandex.ru `models-v2` request: DevTools → Network → Request Headers)."
+    );
   }
-  return chromePath;
+  return browserPath;
 }
 
 /** Sleep helper for polling loops. */
