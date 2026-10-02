@@ -11,6 +11,23 @@ import { hashLocalFile, openLocalFile, putFile } from "./local-file.js";
 
 /** How long one shared search call may keep fetching pages. */
 const SEARCH_TIME_BUDGET_MS = 30_000;
+/** The server returns 20 items per search page whatever `amount` says. */
+const SEARCH_PAGE_SIZE = 20;
+const SEARCH_MAX_PARALLEL_PAGES = 4;
+/** Limits of the folder walk: simultaneous listings and total folders per call. */
+const WALK_CONCURRENCY = 8;
+const WALK_MAX_FOLDERS = 3000;
+
+/** Continuation key for "start at this offset" (`dir;;N`), as the server issues it. */
+function makeOffsetKey(offset: number): string {
+  return Buffer.from(`dir;;${offset}`).toString("base64");
+}
+
+/** Offset from an offset-style continuation key; null for time-cursor keys. */
+function parseOffsetKey(iterationKey: string): number | null {
+  const match = Buffer.from(iterationKey, "base64").toString().match(/^dir;;(\d+)$/);
+  return match ? Number(match[1]) : null;
+}
 
 const WEB_ENTRY_URL ="https://disk.yandex.ru/client/disk";
 
@@ -222,44 +239,108 @@ export class YandexDiskWebClient {
 
   /**
    * Search everything shared with the user, optionally limited to one shared folder.
-   * The server cannot limit the area to a folder, so pages are fetched and filtered
-   * by path here, until `limit` hits are found or the page budget is spent.
+   * - No folder: the server search, pages fetched in parallel while the continuation
+   *   key is an offset (`dir;;N`); sparse results switch to a time cursor, which is
+   *   sequential only.
+   * - With folder: the server cannot limit the area (405) and scanning its pages for a
+   *   narrow folder is slow, so the folder tree is walked with fast listings instead.
    * @param query - text to look for
    * @param options - folder to limit to (user path), wanted hit count, continuation key
-   * @returns hits and the key of the next page (null when the search is exhausted)
+   * @returns hits, the key of the next page (null when exhausted) and whether a folder
+   *   walk was cut short by its limits
    */
   async searchShared(
     query: string,
     options: { folder?: string; limit: number; iterationKey?: string }
-  ): Promise<{ resources: SharedResource[]; iterationKey: string | null }> {
-    const folderPrefix = options.folder ? await this.resolvePath(options.folder) : null;
+  ): Promise<{ resources: SharedResource[]; iterationKey: string | null; truncated: boolean }> {
+    if (options.folder) {
+      return { ...(await this.searchByWalking(query, options.folder, options.limit)), iterationKey: null };
+    }
     const hits: SharedResource[] = [];
     let iterationKey: string | null = options.iterationKey ?? null;
-    // The server answers a page in 2–11 s: a time budget keeps a narrow folder filter
-    // from walking all shared data; the rest is reachable via the returned key
+    // The time budget keeps one call bounded; the rest is reachable via the returned key
     const deadline = Date.now() + SEARCH_TIME_BUDGET_MS;
     while (hits.length < options.limit && Date.now() < deadline) {
-      const page = await this.searchResources(query, {
-        scope: "/aa",
-        // Without a folder filter every item is a hit, so page size = wanted count
-        amount: folderPrefix ? 40 : options.limit,
-        iterationKey: iterationKey ?? undefined,
-      });
-      hits.push(
-        ...page.resources.filter(
-          (resource) =>
-            !folderPrefix ||
-            resource.path === folderPrefix ||
-            resource.path.startsWith(`${folderPrefix}/`)
-        )
+      const startOffset = iterationKey === null ? 0 : parseOffsetKey(iterationKey);
+      // Offset keys allow several pages at once; a cursor key must go one by one
+      const pageCount =
+        startOffset === null
+          ? 1
+          : Math.min(SEARCH_MAX_PARALLEL_PAGES, Math.ceil((options.limit - hits.length) / SEARCH_PAGE_SIZE));
+      const keys = Array.from({ length: pageCount }, (_, index) =>
+        startOffset === null
+          ? iterationKey ?? undefined
+          : index === 0
+            ? iterationKey ?? undefined
+            : makeOffsetKey(startOffset + index * SEARCH_PAGE_SIZE)
       );
-      iterationKey = page.iteration_key ?? null;
-      if (!iterationKey || page.resources.length === 0) {
-        iterationKey = null;
-        break;
+      const pages = await Promise.all(
+        keys.map((key) => this.searchResources(query, { scope: "/aa", iterationKey: key }))
+      );
+      iterationKey = null;
+      for (const page of pages) {
+        hits.push(...page.resources);
+        iterationKey = page.iteration_key ?? null;
+        // Pages after a non-offset key were requested with guessed offsets: drop them
+        if (!iterationKey || parseOffsetKey(iterationKey) === null) break;
       }
+      if (!iterationKey) break;
     }
-    return { resources: hits, iterationKey };
+    return { resources: hits, iterationKey, truncated: false };
+  }
+
+  /**
+   * Find resources by name inside one folder by walking its tree (listing is ~20x
+   * faster than the server search). Folders are listed several at a time.
+   * @param query - case-insensitive substring of the name
+   * @param folder - folder as given by the user
+   * @param limit - stop after this many hits
+   */
+  private async searchByWalking(
+    query: string,
+    folder: string,
+    limit: number
+  ): Promise<{ resources: SharedResource[]; truncated: boolean }> {
+    const needle = query.toLowerCase();
+    const hits: SharedResource[] = [];
+    const queue: string[] = [await this.resolvePath(folder)];
+    const deadline = Date.now() + SEARCH_TIME_BUDGET_MS;
+    let visitedFolders = 0;
+
+    /** List one folder completely (all pages), record hits, queue subfolders. */
+    const visit = async (folderPath: string): Promise<void> => {
+      for (let offset = 0; ; offset += 40) {
+        const { items, rawCount } = await this.listFolderPage(folderPath, { amount: 40, offset });
+        for (const item of items) {
+          if (item.name.toLowerCase().includes(needle)) hits.push(item);
+          if (item.type === "dir") queue.push(item.path.replace(/\/+$/, ""));
+        }
+        if (rawCount < 40) break;
+      }
+    };
+
+    // Worker pool instead of fixed batches: a slow listing must not stall the others
+    const worker = async (): Promise<void> => {
+      while (hits.length < limit && visitedFolders < WALK_MAX_FOLDERS && Date.now() < deadline) {
+        const folderPath = queue.shift();
+        if (folderPath === undefined) {
+          // Queue may refill while other workers still list folders
+          if (activeVisits === 0) return;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          continue;
+        }
+        visitedFolders++;
+        activeVisits++;
+        try {
+          await visit(folderPath);
+        } finally {
+          activeVisits--;
+        }
+      }
+    };
+    let activeVisits = 0;
+    await Promise.all(Array.from({ length: WALK_CONCURRENCY }, worker));
+    return { resources: hits, truncated: queue.length > 0 && hits.length < limit };
   }
 
   /**
@@ -343,6 +424,17 @@ export class YandexDiskWebClient {
     path: string,
     options?: { amount?: number; offset?: number }
   ): Promise<SharedResource[]> {
+    return (await this.listFolderPage(path, options)).items;
+  }
+
+  /**
+   * One page of a folder listing together with the raw page size (the folder itself
+   * can come back as an extra item, so the item count alone cannot tell the last page).
+   */
+  private async listFolderPage(
+    path: string,
+    options?: { amount?: number; offset?: number }
+  ): Promise<{ items: SharedResource[]; rawCount: number }> {
     const folderId = `${path}/`;
     const result = await this.callModel<{ resources: SharedResource[] }>("mpfs/resources", {
       idContext: folderId,
@@ -352,7 +444,10 @@ export class YandexDiskWebClient {
       offset: options?.offset ?? 0,
     });
     // The folder itself may come back as the first item — keep only children
-    return result.resources.filter((resource) => resource.id !== folderId);
+    return {
+      items: result.resources.filter((resource) => resource.id !== folderId),
+      rawCount: result.resources.length,
+    };
   }
 
   /**
