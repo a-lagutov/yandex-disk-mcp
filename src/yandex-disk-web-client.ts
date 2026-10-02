@@ -559,6 +559,17 @@ export class YandexDiskWebClient {
   }
 
   /**
+   * Temporary direct download URL of a file.
+   * @param path - internal path of the file
+   */
+  async getDownloadUrl(path: string): Promise<string> {
+    const result = await this.callModel<{ file?: string }>("mpfs/url", { path });
+    if (!result.file) throw new Error("No download URL returned");
+    // The URL comes protocol-relative ("//downloader.disk.yandex.ru/…")
+    return result.file.startsWith("//") ? `https:${result.file}` : result.file;
+  }
+
+  /**
    * Total size and file count of a folder tree: a cheap change signature (adds,
    * removals and size changes show up; renames and empty new folders do not).
    * @param path - internal path of the folder
