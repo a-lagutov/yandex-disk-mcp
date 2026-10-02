@@ -15,7 +15,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { YandexDiskClient, Resource } from "./yandex-disk-client.js";
 import { loginAndSave, refreshStoredCookie } from "./cookie-source.js";
-import { loadCredentials } from "./credentials.js";
+import { loadCredentials, saveCredentials } from "./credentials.js";
 import { YandexDiskWebClient, SharedResource } from "./yandex-disk-web-client.js";
 import { openLocalFile, putFile, resolveDestinationPath } from "./local-file.js";
 import { basename } from "node:path";
@@ -67,8 +67,14 @@ server.tool(
   "Sign in to Yandex: opens a Chrome window (separate profile) where the user logs in to " +
     "Yandex once; obtains the session cookie (shared folders) and, if an OAuth app client ID " +
     "is known, the OAuth token (own Disk). Credentials are saved and used immediately. " +
-    "Call this when other tools report that the user is not logged in.",
+    "Call this when other tools report that the user is not logged in. Without a Chromium-based " +
+    "browser, pass `token` and/or `cookie` obtained manually instead.",
   {
+    token: z.string().optional().describe("OAuth token (y0_…) to save as is, no browser needed"),
+    cookie: z
+      .string()
+      .optional()
+      .describe("Cookie header of a disk.yandex.ru request to save as is, no browser needed"),
     client_id: z
       .string()
       .optional()
@@ -77,7 +83,22 @@ server.tool(
           "redirect URI https://oauth.yandex.ru/verification_code). Saved for next time."
       ),
   },
-  async ({ client_id }) => {
+  async ({ client_id, token: manualToken, cookie: manualCookie }) => {
+    // Manual mode: credentials were obtained by the user, skip the browser entirely
+    if (manualToken || manualCookie) {
+      saveCredentials({
+        ...(manualToken ? { token: manualToken.trim() } : {}),
+        ...(manualCookie ? { cookie: manualCookie.trim() } : {}),
+        ...(client_id ? { clientId: client_id } : {}),
+      });
+      if (manualToken) client.setToken(manualToken.trim());
+      if (manualCookie) webClient.setCookie(manualCookie.trim());
+      return textResult(
+        `✅ Saved: ${[manualToken && "OAuth token", manualCookie && "session cookie"]
+          .filter(Boolean)
+          .join(" + ")}.`
+      );
+    }
     try {
       const { cookie, token, clientId } = await loginAndSave(client_id);
       webClient.setCookie(cookie);
