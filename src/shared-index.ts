@@ -15,6 +15,8 @@ import { CONFIG_DIR } from "./credentials.js";
 import type { SharedResource, YandexDiskWebClient } from "./yandex-disk-web-client.js";
 
 const INDEX_DIR = join(CONFIG_DIR, "index");
+/** Name of the shared copy of an index, stored in the root of the indexed folder. */
+export const INDEX_FILE_NAME = ".yandex-disk-mcp-index.json.gz";
 const BUILD_CONCURRENCY = 8;
 const CHECKPOINT_INTERVAL_MS = 30_000;
 /** Folders deeper than this have no stored signature: a changed parent re-lists them */
@@ -220,6 +222,7 @@ export class SharedIndex {
           offset,
         });
         for (const item of items) {
+          if (item.name === INDEX_FILE_NAME) continue;
           const itemPath = item.path.replace(/\/+$/, "");
           if (seenPaths.has(itemPath)) continue;
           seenPaths.add(itemPath);
@@ -356,7 +359,7 @@ export class SharedIndex {
     try {
       for (let offset = 0; ; offset += 40) {
         const { items, rawCount } = await this.webClient.listFolderPage(folderPath, { amount: 40, offset });
-        children.push(...items);
+        children.push(...items.filter((item) => item.name !== INDEX_FILE_NAME));
         if (rawCount < 40) break;
       }
     } catch (error) {
@@ -382,6 +385,7 @@ export class SharedIndex {
         active++;
         try {
           for (const item of (await this.listAllChildren(folderPath)) ?? []) {
+            if (item.name === INDEX_FILE_NAME) continue;
             const itemPath = item.path.replace(/\/+$/, "");
             found.push([item.name.trim(), itemPath, item.type === "dir" ? 1 : 0, item.meta?.size ?? 0, item.mtime ?? 0, item.meta?.file_id?.slice(0, 16) ?? ""]);
             if (item.type === "dir") queue.push(itemPath);

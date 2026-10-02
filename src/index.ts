@@ -33,7 +33,7 @@ const client = new YandexDiskClient(initialCredentials.token ?? "");
 // cookie is refreshed automatically from the saved Chrome profile
 const webClient = new YandexDiskWebClient(initialCredentials.cookie ?? "", refreshStoredCookie);
 const sharedIndex = new SharedIndex(webClient);
-const indexSync = new IndexSync(client, sharedIndex);
+const indexSync = new IndexSync(webClient, sharedIndex);
 
 const server = new McpServer({
   name: "yandex-disk",
@@ -711,9 +711,9 @@ server.tool(
     if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
     // A finished local index of the folder answers in milliseconds, without fuzzy noise
     if (folder && !live) {
-      // First use per process: fetch indexes built elsewhere from the user's Disk
-      await indexSync.ensureStartupSync();
       const folderPath = await webClient.resolvePath(folder);
+      // Sync known indexes once and pick up an index a colleague left in the folder's root
+      await indexSync.prepare(folderPath);
       const indexed = sharedIndex.findCovering(folderPath);
       if (indexed) {
         const offset = iteration_key?.startsWith("idx:") ? Number(iteration_key.slice(4)) : 0;
@@ -790,16 +790,17 @@ server.tool(
   async ({ folder, refresh }) => {
     if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
     // Sync first: an index built elsewhere is pulled instead of walking the tree again
-    await indexSync.ensureStartupSync();
+    await indexSync.prepare(await webClient.resolvePath(folder));
     return textResult(await sharedIndex.startBuild(folder, refresh));
   }
 );
 
 server.tool(
   "index_sync",
-  "Sync local shared-folder indexes with your own Yandex Disk (disk:/.yandex-disk-mcp/index). " +
+  "Sync local shared-folder indexes through the root of each indexed folder (file " +
+    ".yandex-disk-mcp-index.json.gz, shared with everyone who uses the folder). " +
     "Newer wins, the other copy is kept as .bak. Runs automatically before a build, on the first " +
-    "indexed search and after a build; call it to sync on demand. Needs the OAuth token. " +
+    "indexed search and after a build; call it to sync on demand. Uploading needs the write right. " +
     "Disable with YANDEX_INDEX_SYNC=off.",
   {},
   async () => textResult(await indexSync.syncAll())
