@@ -192,4 +192,4 @@ docker run -i --rm -e YANDEX_DISK_TOKEN -e YANDEX_SESSION_COOKIE yandex-disk-mcp
 
 ## Лицензия
 
-MIT
+MIT — см. [LICENSE](LICENSE).
