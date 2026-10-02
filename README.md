@@ -6,7 +6,7 @@ MCP server for Yandex Disk: your own files, public links, trash, **shared folder
 
 Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 
-## Tools (30)
+## Tools (31)
 
 ### Login
 
@@ -50,6 +50,7 @@ Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 | `list_shared_folder` | Shared folder contents (up to 40 at a time, then `offset`) |
 | `shared_create_folder` | Create a folder |
 | `shared_move` | Move / rename |
+| `shared_copy` | Copy (same destination rules as `shared_move`) ⚠️ tested on your own Disk only, not on a live shared folder |
 | `shared_delete` | Delete (to the owner's trash). A shared folder root cannot be deleted |
 | `shared_upload_file` | Upload a local file ⚠️ not tested on a live folder |
 
@@ -177,7 +178,7 @@ The shared folder name is as in `list_shared_with_me`. A destination path ending
 ## How it works
 
 - `src/yandex-disk-client.ts` — official REST API (`cloud-api.yandex.net/v1/disk`), OAuth token.
-- `src/yandex-disk-web-client.ts` — **undocumented** web API (`disk.yandex.ru/models-v2`, for Yandex 360 accounts `disk.360.yandex.ru`, the host is detected from the redirect), cookie + the `sk` CSRF token from the Disk page. Methods: `mpfs/resources`, `mpfs/mkdir`, `mpfs/bulk-async-move`, `mpfs/bulk-async-delete`, `mpfs/bulk-operation-status`, `mpfs/store`. May break without notice.
+- `src/yandex-disk-web-client.ts` — **undocumented** web API (`disk.yandex.ru/models-v2`, for Yandex 360 accounts `disk.360.yandex.ru`, the host is detected from the redirect), cookie + the `sk` CSRF token from the Disk page. Methods: `mpfs/resources`, `mpfs/mkdir`, `mpfs/bulk-async-move`, `mpfs/bulk-async-copy`, `mpfs/bulk-async-delete`, `mpfs/bulk-operation-status`, `mpfs/store`. May break without notice.
 - `src/credentials.ts` — token and cookie store (`credentials.json`, mode 600); environment variables override it.
 - `src/cookie-source.ts` — login and cookie refresh through a Chromium-based browser over the DevTools protocol (separate profile), OAuth token issue.
 - `src/login-cli.ts` — the same from a terminal: `npm run login`.
