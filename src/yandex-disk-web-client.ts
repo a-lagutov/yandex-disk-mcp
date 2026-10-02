@@ -9,6 +9,9 @@
 
 import { hashLocalFile, openLocalFile, putFile } from "./local-file.js";
 
+/** How long one shared search call may keep fetching pages. */
+const SEARCH_TIME_BUDGET_MS = 30_000;
+
 const WEB_ENTRY_URL ="https://disk.yandex.ru/client/disk";
 
 /** Resource shown on the "Общий доступ" page. */
@@ -187,6 +190,93 @@ export class YandexDiskWebClient {
       shouldUseContactUser: "1",
       isPublicSavedLinks: "1",
     });
+  }
+
+  // ─── Search ───────────────────────────────────────────
+
+  /**
+   * Run one page of the web client's search (same request as the search box).
+   * The server only searches whole areas: "/disk" (own Disk) or "/aa" (everything
+   * shared with the user); narrowing to one folder is not supported (405).
+   * @param query - text to look for
+   * @param options - search area, page size and the continuation key / offset
+   */
+  async searchResources(
+    query: string,
+    options: { scope: "/disk" | "/aa"; amount?: number; offset?: number; iterationKey?: string }
+  ): Promise<SharedResourcesPage> {
+    return this.callModel<SharedResourcesPage>("mpfs/resources", {
+      sort: "name",
+      order: "1",
+      idContext: `/search/${encodeURIComponent(query)}${options.scope}`,
+      amount: Math.min(Math.max(options.amount ?? 40, 1), 40),
+      offset: options.offset ?? 0,
+      withParent: "1",
+      iteration_key: options.iterationKey ?? null,
+      querySearch: query,
+      scopeSearch: options.scope,
+      sessionIdSearch: { sessionId: `${Date.now()}-${Math.floor(Math.random() * 1e16)}` },
+      with_share: "1",
+    });
+  }
+
+  /**
+   * Search everything shared with the user, optionally limited to one shared folder.
+   * The server cannot limit the area to a folder, so pages are fetched and filtered
+   * by path here, until `limit` hits are found or the page budget is spent.
+   * @param query - text to look for
+   * @param options - folder to limit to (user path), wanted hit count, continuation key
+   * @returns hits and the key of the next page (null when the search is exhausted)
+   */
+  async searchShared(
+    query: string,
+    options: { folder?: string; limit: number; iterationKey?: string }
+  ): Promise<{ resources: SharedResource[]; iterationKey: string | null }> {
+    const folderPrefix = options.folder ? await this.resolvePath(options.folder) : null;
+    const hits: SharedResource[] = [];
+    let iterationKey: string | null = options.iterationKey ?? null;
+    // The server answers a page in 2–11 s: a time budget keeps a narrow folder filter
+    // from walking all shared data; the rest is reachable via the returned key
+    const deadline = Date.now() + SEARCH_TIME_BUDGET_MS;
+    while (hits.length < options.limit && Date.now() < deadline) {
+      const page = await this.searchResources(query, {
+        scope: "/aa",
+        // Without a folder filter every item is a hit, so page size = wanted count
+        amount: folderPrefix ? 40 : options.limit,
+        iterationKey: iterationKey ?? undefined,
+      });
+      hits.push(
+        ...page.resources.filter(
+          (resource) =>
+            !folderPrefix ||
+            resource.path === folderPrefix ||
+            resource.path.startsWith(`${folderPrefix}/`)
+        )
+      );
+      iterationKey = page.iteration_key ?? null;
+      if (!iterationKey || page.resources.length === 0) {
+        iterationKey = null;
+        break;
+      }
+    }
+    return { resources: hits, iterationKey };
+  }
+
+  /**
+   * Convert an internal path to the readable form used by the tools:
+   * "/aa/d_…/Tasks" → "ADV Team 2/Tasks", "/disk/a/b" → "disk:/a/b".
+   * @param internalPath - path as returned by the web API
+   */
+  async toDisplayPath(internalPath: string): Promise<string> {
+    if (internalPath.startsWith("/disk")) return `disk:${internalPath.slice("/disk".length) || "/"}`;
+    const folders = await this.getAllSharedFolders();
+    const root = folders.find(
+      (folder) =>
+        internalPath === folder.path.replace(/\/+$/, "") ||
+        internalPath.startsWith(`${folder.path.replace(/\/+$/, "")}/`)
+    );
+    if (!root) return internalPath;
+    return `${root.name.trim()}${internalPath.slice(root.path.replace(/\/+$/, "").length)}`;
   }
 
   // ─── Paths inside shared folders ──────────────────────

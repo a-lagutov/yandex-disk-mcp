@@ -6,7 +6,7 @@ MCP server for Yandex Disk: your own files, public links, trash, **shared folder
 
 Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 
-## Tools (31)
+## Tools (32)
 
 ### Login
 
@@ -21,7 +21,7 @@ Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 | `disk_info` | Total space, used space, trash size |
 | `list_files` | Folder contents |
 | `get_file_info` | File/folder metadata |
-| `search_files` | All files, filter by type |
+| `search_files` | Search by name (`query`, needs `login`), or list all files with a type filter |
 | `last_uploaded` | Recently uploaded |
 | `create_folder` | Create a folder |
 | `copy` / `move` | Copy / move, rename |
@@ -47,6 +47,7 @@ Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 | Tool | What it does |
 |---|---|
 | `list_shared_with_me` | The "Shared" section: folders/files, owner, rights, link. Next page via `iteration_key` from the response |
+| `shared_search` | Search by name across all shared folders, or inside one (`folder`). Slow — see Limitations; next page via `iteration_key` |
 | `list_shared_folder` | Shared folder contents (up to 40 at a time, then `offset`) |
 | `shared_create_folder` | Create a folder |
 | `shared_move` | Move / rename |
@@ -188,6 +189,7 @@ The public REST API does not return the "Shared" list and cannot write to other 
 
 ## Limitations
 
+- Search (`shared_search`, `search_files` with `query`) is the web client's own search and is slow on Yandex's side: 2–11 s per page of 20. The server cannot limit the area to one shared folder, so `folder` filters hits here and may need several pages; one call stops after about 30 s and returns an `iteration_key` to continue.
 - Writing to a read-only shared folder — the error format is not verified.
 - `list_shared_folder` returns up to 40 items per request — use `offset` for more.
 - Move/delete waits up to 15 s; for large folders it returns "in progress" and the operation continues on Yandex's side.
