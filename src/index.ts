@@ -436,8 +436,10 @@ server.tool(
 
 server.tool(
   "search_files",
-  "Search/list all files on disk with optional media type filter",
+  "Search your own Disk by name (`query`), or list all files with an optional media type filter. " +
+    "Name search needs a session (see `login`) and ignores media_type/sort.",
   {
+    query: z.string().optional().describe("Text to look for in names; omit to list all files"),
     limit: z.number().optional().default(20).describe("Max items"),
     offset: z.number().optional().default(0).describe("Offset"),
     media_type: z
@@ -451,7 +453,14 @@ server.tool(
       .optional()
       .describe("Sort: name, path, created, modified, size (prefix '-' for desc)"),
   },
-  async ({ limit, offset, media_type, sort }) => {
+  async ({ query, limit, offset, media_type, sort }) => {
+    if (query) {
+      // The REST API has no name search; the web client's search box does
+      const page = await webClient.searchResources(query, { scope: "/disk", amount: limit, offset });
+      if (page.resources.length === 0) return textResult(`Nothing found for "${query}".`);
+      const lines = await Promise.all(page.resources.map(formatSearchHit));
+      return textResult([`🔎 "${query}" (showing ${lines.length}, offset ${offset}):`, "", ...lines].join("\n"));
+    }
     const result = await client.getFlatFileList({ limit, offset, media_type, sort });
     if (result.items.length === 0) {
       return textResult("No files found matching criteria.");
@@ -638,6 +647,50 @@ server.tool(
     }
     const lines = items.map((item) => `${item.type === "dir" ? "📁" : "📄"} ${item.name}`);
     return textResult([`📂 ${path} (showing ${items.length}):`, "", ...lines].join("\n"));
+  }
+);
+
+/** Format one search hit as a line with its readable path. */
+async function formatSearchHit(resource: SharedResource): Promise<string> {
+  const icon = resource.type === "dir" ? "📁" : "📄";
+  const size = resource.meta?.size ? ` (${formatSize(resource.meta.size)})` : "";
+  return `${icon} ${resource.name.trim()}${size} — ${await webClient.toDisplayPath(resource.path)}`;
+}
+
+server.tool(
+  "shared_search",
+  "Search files and folders shared with the user by name (all shared folders at once, or one " +
+    "shared folder). Requires a session (see `login`). Next page: pass `iteration_key` from the " +
+    "previous answer.",
+  {
+    query: z.string().describe("Text to look for in names"),
+    folder: z
+      .string()
+      .optional()
+      .describe(`Limit to one shared folder or subfolder. ${SHARED_PATH_DESCRIPTION}`),
+    limit: z.number().optional().default(20).describe("Wanted number of hits (may return a bit more)"),
+    iteration_key: z.string().optional().describe("Continuation key from the previous answer"),
+  },
+  async ({ query, folder, limit, iteration_key }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const { resources, iterationKey } = await webClient.searchShared(query, {
+      folder,
+      limit,
+      iterationKey: iteration_key,
+    });
+    if (resources.length === 0) {
+      return textResult(
+        `Nothing found for "${query}"` +
+          (iterationKey
+            ? ` yet — search is slow, not finished. Continue: iteration_key=${iterationKey}`
+            : ".")
+      );
+    }
+    const lines = await Promise.all(resources.map(formatSearchHit));
+    const footer = iterationKey ? ["", `More: iteration_key=${iterationKey}`] : [];
+    return textResult(
+      [`🔎 "${query}"${folder ? ` in ${folder}` : ""} (showing ${lines.length}):`, "", ...lines, ...footer].join("\n")
+    );
   }
 );
 
