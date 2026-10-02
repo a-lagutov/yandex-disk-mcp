@@ -7,6 +7,7 @@
  * The API may change without notice.
  */
 
+import { randomUUID } from "node:crypto";
 import { hashLocalFile, openLocalFile, putFile } from "./local-file.js";
 
 /** How long one shared search call may keep fetching pages. */
@@ -17,6 +18,13 @@ const SEARCH_MAX_PARALLEL_PAGES = 4;
 /** Limits of the folder walk: simultaneous listings and total folders per call. */
 const WALK_CONCURRENCY = 8;
 const WALK_MAX_FOLDERS = 3000;
+
+/** How long a folder-walk continuation stays valid, and how many are kept. */
+const WALK_SESSION_TTL_MS = 30 * 60_000;
+const WALK_SESSION_MAX = 20;
+
+/** Prefix that marks a folder-walk continuation key (server-search keys are base64). */
+const WALK_KEY_PREFIX = "walk:";
 
 /** Continuation key for "start at this offset" (`dir;;N`), as the server issues it. */
 function makeOffsetKey(offset: number): string {
@@ -71,6 +79,8 @@ export class YandexDiskWebClient {
   private sk: string | null = null;
   // Disk web host differs for Yandex 360 accounts (disk.360.yandex.ru), detected from redirect
   private origin: string | null = null;
+  // Folders still to visit by an interrupted search, kept in memory for continuation
+  private walkSessions = new Map<string, { query: string; queue: string[]; expiresAt: number }>();
   private sharedFoldersCache: { items: SharedResource[]; loadedAt: number } | null = null;
 
   /**
@@ -246,15 +256,15 @@ export class YandexDiskWebClient {
    *   narrow folder is slow, so the folder tree is walked with fast listings instead.
    * @param query - text to look for
    * @param options - folder to limit to (user path), wanted hit count, continuation key
-   * @returns hits, the key of the next page (null when exhausted) and whether a folder
-   *   walk was cut short by its limits
+   * @returns hits and the key of the next page (null when exhausted)
    */
   async searchShared(
     query: string,
     options: { folder?: string; limit: number; iterationKey?: string }
-  ): Promise<{ resources: SharedResource[]; iterationKey: string | null; truncated: boolean }> {
-    if (options.folder) {
-      return { ...(await this.searchByWalking(query, options.folder, options.limit)), iterationKey: null };
+  ): Promise<{ resources: SharedResource[]; iterationKey: string | null }> {
+    // A walk continuation carries its own folder, so `folder` is not needed with it
+    if (options.folder || options.iterationKey?.startsWith(WALK_KEY_PREFIX)) {
+      return this.searchByWalking(query, options.folder, options.limit, options.iterationKey);
     }
     const hits: SharedResource[] = [];
     let iterationKey: string | null = options.iterationKey ?? null;
@@ -286,26 +296,44 @@ export class YandexDiskWebClient {
       }
       if (!iterationKey) break;
     }
-    return { resources: hits, iterationKey, truncated: false };
+    return { resources: hits, iterationKey };
   }
 
   /**
    * Find resources by name inside one folder by walking its tree (listing is ~20x
-   * faster than the server search). Folders are listed several at a time.
+   * faster than the server search). Folders are listed several at a time. When the
+   * time budget or the hit limit stops the walk, the folders not visited yet are kept
+   * in memory and a continuation key is returned.
    * @param query - case-insensitive substring of the name
-   * @param folder - folder as given by the user
+   * @param folder - folder as given by the user (not needed when resuming)
    * @param limit - stop after this many hits
+   * @param resumeKey - key from an earlier call that was cut short
    */
   private async searchByWalking(
     query: string,
-    folder: string,
-    limit: number
-  ): Promise<{ resources: SharedResource[]; truncated: boolean }> {
+    folder: string | undefined,
+    limit: number,
+    resumeKey?: string
+  ): Promise<{ resources: SharedResource[]; iterationKey: string | null }> {
+    this.dropExpiredWalkSessions();
+    let queue: string[];
+    if (resumeKey?.startsWith(WALK_KEY_PREFIX)) {
+      const session = this.walkSessions.get(resumeKey);
+      if (!session) {
+        throw new Error("Search continuation expired or unknown — repeat the search");
+      }
+      this.walkSessions.delete(resumeKey);
+      query = session.query;
+      queue = session.queue;
+    } else {
+      queue = [await this.resolvePath(folder!)];
+    }
+
     const needle = query.toLowerCase();
     const hits: SharedResource[] = [];
-    const queue: string[] = [await this.resolvePath(folder)];
     const deadline = Date.now() + SEARCH_TIME_BUDGET_MS;
     let visitedFolders = 0;
+    let activeVisits = 0;
 
     /** List one folder completely (all pages), record hits, queue subfolders. */
     const visit = async (folderPath: string): Promise<void> => {
@@ -333,14 +361,33 @@ export class YandexDiskWebClient {
         activeVisits++;
         try {
           await visit(folderPath);
+        } catch (error) {
+          // Keep the folder for the continuation instead of losing it with the error
+          queue.unshift(folderPath);
+          throw error;
         } finally {
           activeVisits--;
         }
       }
     };
-    let activeVisits = 0;
     await Promise.all(Array.from({ length: WALK_CONCURRENCY }, worker));
-    return { resources: hits, truncated: queue.length > 0 && hits.length < limit };
+
+    if (queue.length === 0) return { resources: hits, iterationKey: null };
+    const key = `${WALK_KEY_PREFIX}${randomUUID()}`;
+    this.walkSessions.set(key, { query, queue, expiresAt: Date.now() + WALK_SESSION_TTL_MS });
+    // Oldest sessions go first when too many searches were left unfinished
+    while (this.walkSessions.size > WALK_SESSION_MAX) {
+      this.walkSessions.delete(this.walkSessions.keys().next().value!);
+    }
+    return { resources: hits, iterationKey: key };
+  }
+
+  /** Forget continuations nobody came back for. */
+  private dropExpiredWalkSessions(): void {
+    const now = Date.now();
+    for (const [key, session] of this.walkSessions) {
+      if (session.expiresAt < now) this.walkSessions.delete(key);
+    }
   }
 
   /**
