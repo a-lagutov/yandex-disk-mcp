@@ -50,9 +50,9 @@ Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 | `list_shared_folder` | Shared folder contents (up to 40 at a time, then `offset`) |
 | `shared_create_folder` | Create a folder |
 | `shared_move` | Move / rename |
-| `shared_copy` | Copy (same destination rules as `shared_move`) ⚠️ tested on your own Disk only, not on a live shared folder |
+| `shared_copy` | Copy (same destination rules as `shared_move`) |
 | `shared_delete` | Delete (to the owner's trash). A shared folder root cannot be deleted |
-| `shared_upload_file` | Upload a local file ⚠️ not tested on a live folder |
+| `shared_upload_file` | Upload a local file |
 
 ### Yandex 360 for business
 
@@ -188,7 +188,6 @@ The public REST API does not return the "Shared" list and cannot write to other 
 
 ## Limitations
 
-- `shared_upload_file` is built from the web client code and not yet tested on a real shared folder.
 - Writing to a read-only shared folder — the error format is not verified.
 - `list_shared_folder` returns up to 40 items per request — use `offset` for more.
 - Move/delete waits up to 15 s; for large folders it returns "in progress" and the operation continues on Yandex's side.
