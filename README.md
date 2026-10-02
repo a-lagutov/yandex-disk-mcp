@@ -1,63 +1,65 @@
 # Yandex Disk MCP Server
 
-MCP-сервер для Яндекс Диска: свои файлы, публичные ссылки, корзина, **общие папки** (чтение и запись), загрузка локальных файлов. Работает с любым MCP-клиентом (Claude Code, Claude Desktop, Cursor и др.).
+**English** · [Русский](README.ru.md)
 
-Требуется **Node.js ≥ 20** (для `login` — **≥ 22**).
+MCP server for Yandex Disk: your own files, public links, trash, **shared folders** (read and write), local file upload. Works with any MCP client (Claude Code, Claude Desktop, Cursor, etc.).
 
-## Инструменты (30)
+Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 
-### Вход
+## Tools (30)
 
-| Инструмент | Что делает |
+### Login
+
+| Tool | What it does |
 |---|---|
-| `login` | Вход через окно браузера: cookie сессии + OAuth-токен, сохраняются сами |
+| `login` | Sign in through a browser window: session cookie + OAuth token, saved automatically |
 
-### Свой Диск — официальный REST API
+### Your Disk — official REST API
 
-| Инструмент | Что делает |
+| Tool | What it does |
 |---|---|
-| `disk_info` | Объём, занято, корзина |
-| `list_files` | Содержимое папки |
-| `get_file_info` | Метаданные файла/папки |
-| `search_files` | Все файлы, фильтр по типу |
-| `last_uploaded` | Недавно загруженные |
-| `create_folder` | Создать папку |
-| `copy` / `move` | Копировать / переместить, переименовать |
-| `delete` | Удалить (в корзину или навсегда) |
-| `upload_file` | Загрузить локальный файл |
-| `upload_from_url` | Загрузить по внешнему URL |
-| `get_upload_link` | URL для загрузки (PUT) |
-| `get_download_link` | Ссылка на скачивание |
-| `operation_status` | Статус асинхронной операции |
-| `list_trash` / `restore_from_trash` / `clear_trash` | Корзина |
+| `disk_info` | Total space, used space, trash size |
+| `list_files` | Folder contents |
+| `get_file_info` | File/folder metadata |
+| `search_files` | All files, filter by type |
+| `last_uploaded` | Recently uploaded |
+| `create_folder` | Create a folder |
+| `copy` / `move` | Copy / move, rename |
+| `delete` | Delete (to trash or permanently) |
+| `upload_file` | Upload a local file |
+| `upload_from_url` | Upload from an external URL |
+| `get_upload_link` | Upload URL (PUT) |
+| `get_download_link` | Download link |
+| `operation_status` | Status of an async operation |
+| `list_trash` / `restore_from_trash` / `clear_trash` | Trash |
 
-### Публичные ссылки — официальный API
+### Public links — official API
 
-| Инструмент | Что делает |
+| Tool | What it does |
 |---|---|
-| `publish` / `unpublish` | Открыть / закрыть доступ по ссылке |
-| `list_public` | Мои опубликованные ресурсы |
-| `list_public_folder` | Содержимое папки по публичной ссылке |
-| `get_public_download_link` | Скачать файл из папки по публичной ссылке (без `path` — вся папка zip-архивом) |
+| `publish` / `unpublish` | Open / close access by link |
+| `list_public` | My published resources |
+| `list_public_folder` | Folder contents by public link |
+| `get_public_download_link` | Download a file from a public folder (without `path` — the whole folder as a zip) |
 
-### Общие папки — веб-API, нужна cookie сессии (`login`)
+### Shared folders — web API, needs the session cookie (`login`)
 
-| Инструмент | Что делает |
+| Tool | What it does |
 |---|---|
-| `list_shared_with_me` | Раздел «Общий доступ»: папки/файлы, владелец, права, ссылка. Следующая страница — через `iteration_key` из ответа |
-| `list_shared_folder` | Содержимое общей папки (до 40 за раз, дальше — `offset`) |
-| `shared_create_folder` | Создать папку |
-| `shared_move` | Переместить / переименовать |
-| `shared_delete` | Удалить (в корзину владельца). Корень общей папки удалить нельзя |
-| `shared_upload_file` | Загрузить локальный файл ⚠️ не проверено на живой папке |
+| `list_shared_with_me` | The "Shared" section: folders/files, owner, rights, link. Next page via `iteration_key` from the response |
+| `list_shared_folder` | Shared folder contents (up to 40 at a time, then `offset`) |
+| `shared_create_folder` | Create a folder |
+| `shared_move` | Move / rename |
+| `shared_delete` | Delete (to the owner's trash). A shared folder root cannot be deleted |
+| `shared_upload_file` | Upload a local file ⚠️ not tested on a live folder |
 
-### Яндекс 360 для бизнеса
+### Yandex 360 for business
 
-| Инструмент | Что делает |
+| Tool | What it does |
 |---|---|
-| `list_shared_disks` | Общие диски организации и права на них. Нужен `org_id` / `YANDEX_ORG_ID`. Автоопределение организации (право `directory:read_organization`) работает только у администратора — у остальных API 360 возвращает пустой список |
+| `list_shared_disks` | Organization shared disks and rights on them. Needs `org_id` / `YANDEX_ORG_ID`. Auto-detecting the organization (the `directory:read_organization` right) works for administrators only — for others the 360 API returns an empty list |
 
-## Установка
+## Installation
 
 ```bash
 git clone https://github.com/a-lagutov/yandex-disk-mcp.git
@@ -66,54 +68,54 @@ npm install
 npm run build
 ```
 
-## Вход
+## Login
 
-Сервер запускается **без каких-либо настроек**. Доступ даёт инструмент `login`:
+The server starts with **no configuration at all**. The `login` tool gives access:
 
-- **Общие папки** — достаточно входа в Яндекс (cookie), OAuth-приложение не нужно.
-- **Свой Диск, публичные ссылки, корзина, загрузка** — нужен OAuth-токен, значит, и OAuth-приложение (создаётся один раз).
+- **Shared folders** — signing in to Yandex (cookie) is enough, no OAuth app needed.
+- **Your Disk, public links, trash, upload** — need an OAuth token, so an OAuth app too (created once).
 
-### 1. OAuth-приложение (один раз, только для своего Диска)
+### 1. OAuth app (once, only for your own Disk)
 
-1. https://oauth.yandex.ru → «Создать приложение».
-2. Платформа «Веб-сервисы», redirect URI: `https://oauth.yandex.ru/verification_code`.
-3. Доступы **Яндекс.Диск REST API**: `cloud_api:disk.read`, `cloud_api:disk.write`, `cloud_api:disk.info`.
-   Необязательно, **API Яндекс 360**: `directory:read_organization`.
-4. Скопируйте Client ID — он понадобится при первом входе. Без него `login` получит только cookie: общие папки работают, свой Диск — нет.
+1. https://oauth.yandex.com → "Create app".
+2. Platform "Web services", redirect URI: `https://oauth.yandex.ru/verification_code`.
+3. Access to **Yandex Disk REST API**: `cloud_api:disk.read`, `cloud_api:disk.write`, `cloud_api:disk.info`.
+   Optional, **Yandex 360 API**: `directory:read_organization`.
+4. Copy the Client ID — you need it at the first login. Without it `login` gets only the cookie: shared folders work, your own Disk does not.
 
-> Добавили право позже — вызовите `login` заново. Если право не добавилось, отзовите доступ приложения на https://id.yandex.ru/security и войдите ещё раз.
+> Added a right later — call `login` again. If the right did not appear, revoke the app's access at https://id.yandex.com/security and sign in again.
 
-### 2. Вход через `login`
+### 2. Sign in with `login`
 
-Попросите Claude: «войди в Яндекс Диск, client_id …» (Client ID запоминается, дальше его указывать не нужно). Только общие папки — «войди в Яндекс Диск» без `client_id`. То же без Claude: `npm run login -- --client-id <ID>`.
+Ask Claude: "log in to Yandex Disk, client_id …" (the Client ID is remembered, no need to repeat it). Shared folders only — "log in to Yandex Disk" without `client_id`. Without Claude: `npm run login -- --client-id <ID>`.
 
-1. Откроется окно браузера с **отдельным профилем** (`~/.config/yandex-disk-mcp/chrome-profile`) — войдите в Яндекс.
-2. В том же окне Яндекс выдаст OAuth-токен для вашего приложения (при первом входе нужно нажать «Разрешить»).
-3. Токен и cookie сессии сохраняются в `~/.config/yandex-disk-mcp/credentials.json` (права 600) и работают сразу, без перезапуска.
+1. A browser window opens with a **separate profile** (`~/.config/yandex-disk-mcp/chrome-profile`) — sign in to Yandex.
+2. In the same window Yandex issues an OAuth token for your app (on the first login, click "Allow").
+3. The token and the session cookie are saved to `~/.config/yandex-disk-mcp/credentials.json` (mode 600) and work at once, no restart.
 
-Дальше всё автоматически: cookie общих папок, когда протухнет, обновляется в фоне из сохранённого профиля. Если сессия профиля тоже истекла — инструменты попросят снова вызвать `login`.
+After that it is automatic: when the shared-folders cookie expires, it is refreshed in the background from the saved profile. If the profile session has expired too, tools ask you to call `login` again.
 
-Работает на любой ОС и в любой оболочке (zsh не нужен); на Windows `~` — это `C:\Users\<имя>`. Нужен любой браузер на Chromium: Chrome, Edge, Яндекс.Браузер, Brave, Vivaldi, Chromium (путь можно задать в `YANDEX_CHROME_PATH`), и Node.js ≥ 22.
+Works on any OS and in any shell (zsh is not needed); on Windows `~` is `C:\Users\<name>`. Any Chromium-based browser is required: Chrome, Edge, Yandex Browser, Brave, Vivaldi, Chromium (set the path in `YANDEX_CHROME_PATH`), and Node.js ≥ 22.
 
-**Firefox и Safari** автоматический вход не поддерживают — только ручной режим. Войдите так: откройте `https://oauth.yandex.ru/authorize?response_type=token&client_id=<CLIENT_ID>` в любом браузере и скопируйте `access_token` из адресной строки; cookie — заголовок `Cookie` любого запроса `models-v2` на disk.yandex.ru (DevTools → Network). Передайте их в `login` (`token`, `cookie`) или `npm run login -- --token <T> --cookie <C>`. Автообновление cookie в этом режиме не работает.
+**Firefox and Safari** do not support automatic login — manual mode only. Do this: open `https://oauth.yandex.ru/authorize?response_type=token&client_id=<CLIENT_ID>` in any browser and copy `access_token` from the address bar; the cookie is the `Cookie` header of any `models-v2` request on disk.yandex.ru (DevTools → Network). Pass them to `login` (`token`, `cookie`) or `npm run login -- --token <T> --cookie <C>`. Automatic cookie refresh does not work in this mode.
 
-> ⚠️ Cookie = полный доступ к аккаунту Яндекса, токен — к Диску. Файл `credentials.json` закрыт правами 600; не кладите его в репозиторий. Отдельный профиль браузера изолирует сессию от основного. Отозвать: https://id.yandex.ru/security → «Выйти на всех устройствах». Если нажать «Выйти» в профиле, cookie перестанет работать.
+> ⚠️ The cookie gives full access to your Yandex account, the token — to your Disk. `credentials.json` is protected by mode 600; do not put it in a repository. A separate browser profile isolates the session from your main browser. To revoke: https://id.yandex.com/security → "Sign out on all devices". If you click "Sign out" in the profile, the cookie stops working.
 
-### Переменные окружения (необязательно)
+### Environment variables (optional)
 
-Переопределяют сохранённые значения — например, для Docker/CI, где браузера нет.
+They override the saved values — for example in Docker/CI, where there is no browser.
 
-| Переменная | Для чего |
+| Variable | Purpose |
 |---|---|
-| `YANDEX_DISK_TOKEN` | OAuth-токен (`y0_…`) |
-| `YANDEX_SESSION_COOKIE` | Cookie сессии браузера (заголовок `Cookie` запроса `models-v2` на disk.yandex.ru) |
-| `YANDEX_CLIENT_ID` | Client ID OAuth-приложения |
-| `YANDEX_ORG_ID` | ID организации Яндекс 360 для `list_shared_disks` |
-| `YANDEX_CHROME_PATH` | Путь к браузеру на Chromium, если он в нестандартном месте |
+| `YANDEX_DISK_TOKEN` | OAuth token (`y0_…`) |
+| `YANDEX_SESSION_COOKIE` | Browser session cookie (the `Cookie` header of a `models-v2` request on disk.yandex.ru) |
+| `YANDEX_CLIENT_ID` | OAuth app Client ID |
+| `YANDEX_ORG_ID` | Yandex 360 organization ID for `list_shared_disks` |
+| `YANDEX_CHROME_PATH` | Path to a Chromium-based browser if it is in a non-standard place |
 
-> ⚠️ Переменная **перекрывает** сохранённое значение. Устаревший `YANDEX_DISK_TOKEN` или `YANDEX_SESSION_COOKIE` в окружении даст 401 даже после успешного `login` — удалите его (`unset`, правка `~/.zshenv` и т. п.).
+> ⚠️ A variable **overrides** the saved value. A stale `YANDEX_DISK_TOKEN` or `YANDEX_SESSION_COOKIE` in the environment gives 401 even after a successful `login` — remove it (`unset`, edit `~/.zshenv`, etc.).
 
-## Подключение
+## Connecting
 
 ### Claude Code
 
@@ -121,11 +123,11 @@ npm run build
 claude mcp add yandex-disk --scope user -- node /path/to/yandex-disk-mcp/dist/index.js
 ```
 
-Секреты в конфиге не нужны. Дальше — «войди в Яндекс Диск».
+No secrets in the config. Then ask: "log in to Yandex Disk".
 
-> Не редактируйте `~/.claude.json` вручную при запущенном Claude — файл может быть перезаписан. Используйте `claude mcp add`.
+> Do not edit `~/.claude.json` by hand while Claude is running — the file may be overwritten. Use `claude mcp add`.
 
-### Claude Desktop / Cursor / другие клиенты
+### Claude Desktop / Cursor / other clients
 
 ```json
 {
@@ -139,7 +141,7 @@ claude mcp add yandex-disk --scope user -- node /path/to/yandex-disk-mcp/dist/in
 }
 ```
 
-Переменные не нужны: если входа нет, инструмент ответит «call the `login` tool».
+No variables needed: if there is no login, the tool answers "call the `login` tool".
 
 ### Docker
 
@@ -148,48 +150,48 @@ docker build -t yandex-disk-mcp .
 docker run -i --rm -e YANDEX_DISK_TOKEN -e YANDEX_SESSION_COOKIE yandex-disk-mcp
 ```
 
-В контейнере нет браузера, поэтому `login` не работает и cookie сама не обновляется: возьмите токен и cookie вручную (см. «Вход») и обновляйте cookie, когда она истечёт. `-e VAR` без значения берёт значение из текущего окружения. Через compose: `docker compose run --rm -T yandex-disk-mcp` (переменные из `.env`; `-T` отключает TTY, иначе он может сломать обмен по stdio).
+There is no browser in the container, so `login` does not work and the cookie does not refresh itself: take the token and cookie manually (see "Login") and renew the cookie when it expires. `-e VAR` without a value takes it from the current environment. With compose: `docker compose run --rm -T yandex-disk-mcp` (variables from `.env`; `-T` disables the TTY, which can break stdio exchange).
 
-> В контейнере `upload_file` и `shared_upload_file` видят только файлы контейнера — для загрузки с хоста примонтируйте папку (`-v ~/Uploads:/uploads`).
+> In the container, `upload_file` and `shared_upload_file` see only container files — mount a folder to upload from the host (`-v ~/Uploads:/uploads`).
 
-## Пути
+## Paths
 
-| Где | Формат | Пример |
+| Where | Format | Example |
 |---|---|---|
-| Свой Диск | `disk:/…` | `disk:/Projects/report.pdf` |
-| Общие папки | `<имя общей папки>/…` | `ADV Team 2/Tasks 2026/Новая папка` |
-| Внутри публичной ссылки | ссылка + `path` | `https://yadi.sk/d/…` + `/subfolder` |
+| Your Disk | `disk:/…` | `disk:/Projects/report.pdf` |
+| Shared folders | `<shared folder name>/…` | `ADV Team 2/Tasks 2026/New folder` |
+| Inside a public link | link + `path` | `https://yadi.sk/d/…` + `/subfolder` |
 
-Имя общей папки — как в `list_shared_with_me`. Путь назначения при загрузке, оканчивающийся на `/`, сохраняет имя локального файла. Запись в общие папки — только с правом `write`.
+The shared folder name is as in `list_shared_with_me`. A destination path ending in `/` keeps the local file name on upload. Writing to shared folders needs the `write` right.
 
-## Примеры запросов
+## Example prompts
 
-- «Что лежит на моём Диске?»
-- «Какие общие папки мне доступны?»
-- «Покажи содержимое ADV Team 2/Tasks 2026»
-- «Создай папку ADV Team 2/Tasks 2026/Новый проект»
-- «Загрузи ~/Desktop/report.pdf в ADV Team 2/Tasks 2026/»
-- «Сделай disk:/photo.jpg публичным и дай ссылку»
-- «Что в корзине? Восстанови последний удалённый файл»
+- "What is on my Disk?"
+- "Which shared folders do I have?"
+- "Show the contents of ADV Team 2/Tasks 2026"
+- "Create the folder ADV Team 2/Tasks 2026/New project"
+- "Upload ~/Desktop/report.pdf to ADV Team 2/Tasks 2026/"
+- "Make disk:/photo.jpg public and give me the link"
+- "What is in the trash? Restore the last deleted file"
 
-## Как устроено
+## How it works
 
-- `src/yandex-disk-client.ts` — официальный REST API (`cloud-api.yandex.net/v1/disk`), OAuth-токен.
-- `src/yandex-disk-web-client.ts` — **недокументированный** API веб-версии (`disk.yandex.ru/models-v2`, для аккаунтов Яндекс 360 — `disk.360.yandex.ru`, хост определяется по редиректу), cookie + CSRF-токен `sk` со страницы Диска. Методы: `mpfs/resources`, `mpfs/mkdir`, `mpfs/bulk-async-move`, `mpfs/bulk-async-delete`, `mpfs/bulk-operation-status`, `mpfs/store`. Может сломаться без предупреждения.
-- `src/credentials.ts` — хранилище токена и cookie (`credentials.json`, права 600), переменные окружения перекрывают его.
-- `src/cookie-source.ts` — вход и обновление cookie через браузер на Chromium по протоколу DevTools (отдельный профиль), выдача OAuth-токена.
-- `src/login-cli.ts` — то же из терминала: `npm run login`.
-- `src/local-file.ts` — чтение локальных файлов потоком, хэши, PUT.
+- `src/yandex-disk-client.ts` — official REST API (`cloud-api.yandex.net/v1/disk`), OAuth token.
+- `src/yandex-disk-web-client.ts` — **undocumented** web API (`disk.yandex.ru/models-v2`, for Yandex 360 accounts `disk.360.yandex.ru`, the host is detected from the redirect), cookie + the `sk` CSRF token from the Disk page. Methods: `mpfs/resources`, `mpfs/mkdir`, `mpfs/bulk-async-move`, `mpfs/bulk-async-delete`, `mpfs/bulk-operation-status`, `mpfs/store`. May break without notice.
+- `src/credentials.ts` — token and cookie store (`credentials.json`, mode 600); environment variables override it.
+- `src/cookie-source.ts` — login and cookie refresh through a Chromium-based browser over the DevTools protocol (separate profile), OAuth token issue.
+- `src/login-cli.ts` — the same from a terminal: `npm run login`.
+- `src/local-file.ts` — streaming reads of local files, hashes, PUT.
 
-Публичный REST API не отдаёт список «Общий доступ» и не умеет писать в чужие папки — поэтому веб-API.
+The public REST API does not return the "Shared" list and cannot write to other people's folders — hence the web API.
 
-## Ограничения
+## Limitations
 
-- `shared_upload_file` собран по коду веб-клиента и ещё не проверен на реальной общей папке.
-- Попытка записи в общую папку только для чтения — формат ошибки не проверен.
-- `list_shared_folder` отдаёт до 40 элементов за запрос — дальше через `offset`.
-- Перемещение/удаление ждёт до 15 с; для больших папок вернёт «in progress», операция продолжится на стороне Яндекса.
+- `shared_upload_file` is built from the web client code and not yet tested on a real shared folder.
+- Writing to a read-only shared folder — the error format is not verified.
+- `list_shared_folder` returns up to 40 items per request — use `offset` for more.
+- Move/delete waits up to 15 s; for large folders it returns "in progress" and the operation continues on Yandex's side.
 
-## Лицензия
+## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
