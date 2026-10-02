@@ -15,6 +15,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { YandexDiskClient, Resource } from "./yandex-disk-client.js";
+import { YandexDiskWebClient, SharedResource } from "./yandex-disk-web-client.js";
 
 // ─── Init ───────────────────────────────────────────────
 
@@ -28,6 +29,10 @@ if (!token) {
 }
 
 const client = new YandexDiskClient(token);
+
+// Optional: browser session cookie for the internal web API (shared-with-me list)
+const sessionCookie = process.env.YANDEX_SESSION_COOKIE;
+const webClient = sessionCookie ? new YandexDiskWebClient(sessionCookie) : null;
 
 const server = new McpServer({
   name: "yandex-disk",
@@ -397,6 +402,174 @@ server.tool(
     }
     const items = result.items.map(formatResource);
     return textResult(["⏱️ Recently uploaded:", "", ...items].join("\n"));
+  }
+);
+
+// ─── Tool: list_shared_disks ────────────────────────────
+
+server.tool(
+  "list_shared_disks",
+  "List Yandex 360 organization shared disks the user has access to, with permissions. " +
+    "Note: personal shared folders (invites from other users) are not exposed by the public API.",
+  {
+    org_id: z
+      .string()
+      .optional()
+      .describe(
+        "Yandex 360 organization ID. Optional: defaults to YANDEX_ORG_ID env variable, " +
+          "otherwise all organizations of the user are discovered automatically"
+      ),
+    limit: z.number().optional().default(20).describe("Max items per organization (1–100)"),
+    offset: z.number().optional().default(0).describe("Offset"),
+  },
+  async ({ org_id, limit, offset }) => {
+    const explicitOrgId = org_id ?? process.env.YANDEX_ORG_ID;
+
+    // Without an explicit ID, discover organizations via Yandex 360 Directory API
+    let organizations: { id: string; name?: string }[];
+    if (explicitOrgId) {
+      organizations = [{ id: explicitOrgId }];
+    } else {
+      try {
+        const found = await client.getOrganizations();
+        organizations = found.map((org) => ({ id: String(org.id), name: org.name }));
+      } catch (error) {
+        return textResult(
+          `❌ Could not detect organization automatically: ${(error as Error).message}\n` +
+            "Add the `directory:read_organization` scope to the OAuth app and reissue the token, " +
+            "or pass org_id / set YANDEX_ORG_ID."
+        );
+      }
+      if (organizations.length === 0) {
+        return textResult("No Yandex 360 organizations found for this account.");
+      }
+    }
+
+    const sections: string[] = [];
+    for (const organization of organizations) {
+      const result = await client.getSharedDisks(organization.id, { limit, offset });
+      const title = organization.name
+        ? `${organization.name} (org ${organization.id})`
+        : `org ${organization.id}`;
+      if (result.items.length === 0) {
+        sections.push(`🏢 ${title}: no shared disks available.`);
+        continue;
+      }
+      const items = result.items.map(
+        (disk) =>
+          `🗄️ ${disk.name} — ${formatSize(disk.used_space)} / ${formatSize(disk.total_space)}` +
+          ` — rights: ${disk.permissions.join(", ") || "none"} — id: ${disk.resource_id}`
+      );
+      sections.push([`🏢 ${title} — ${result.total} shared disks:`, ...items].join("\n"));
+    }
+    return textResult(sections.join("\n\n"));
+  }
+);
+
+// ─── Tool: list_shared_with_me ──────────────────────────
+
+/**
+ * Format a shared resource as one line: name, owner, rights and public link.
+ * @param resource - item from the "Общий доступ" page
+ */
+function formatSharedResource(resource: SharedResource): string {
+  const icon = resource.type === "dir" ? "📁" : "📄";
+  const owner = resource.owner?.self ? "you" : resource.owner?.displayName ?? "unknown";
+  const rights = resource.meta?.rights?.join(", ") || "unknown";
+  const link = resource.meta?.short_url ? ` 🔗 ${resource.meta.short_url}` : "";
+  return `${icon} ${resource.name} — owner: ${owner} — rights: ${rights}${link}`;
+}
+
+server.tool(
+  "list_shared_with_me",
+  "List folders or files shared with the user (the 'Общий доступ' page of Yandex Disk web), " +
+    "with owner, access rights and public link. Browse a folder's contents with list_public_folder " +
+    "using its link. Uses the undocumented web API and requires YANDEX_SESSION_COOKIE.",
+  {
+    type: z
+      .enum(["folders", "files"])
+      .optional()
+      .default("folders")
+      .describe("What to list: 'folders' (default) or 'files'"),
+    limit: z.number().optional().default(40).describe("Max items per page (1–40)"),
+    iteration_key: z
+      .string()
+      .optional()
+      .describe("Continuation key from the previous page to get the next one"),
+  },
+  async ({ type, limit, iteration_key }) => {
+    if (!webClient) {
+      return textResult(
+        "❌ YANDEX_SESSION_COOKIE is not set.\n" +
+          "Copy the Cookie header of any disk.yandex.ru request from browser DevTools " +
+          "and put it into the server env as YANDEX_SESSION_COOKIE."
+      );
+    }
+    const page = await webClient.getSharedResources(type, {
+      amount: limit,
+      iterationKey: iteration_key,
+    });
+    if (page.resources.length === 0) {
+      return textResult(`No shared ${type} found.`);
+    }
+    const lines = [
+      `🤝 Shared ${type} (showing ${page.resources.length}):`,
+      "",
+      ...page.resources.map(formatSharedResource),
+    ];
+    // A full page means there may be more; hand the key back for pagination
+    if (page.iteration_key && page.resources.length >= Math.min(limit, 40)) {
+      lines.push("", `More available — iteration_key: ${page.iteration_key}`);
+    }
+    return textResult(lines.join("\n"));
+  }
+);
+
+// ─── Tool: list_public_folder ───────────────────────────
+
+server.tool(
+  "list_public_folder",
+  "List contents of a shared/public folder by its public link (e.g. https://yadi.sk/d/...) " +
+    "or public key. Works for links returned by list_shared_with_me and list_public.",
+  {
+    public_key: z.string().describe("Public URL (https://yadi.sk/d/...) or public key"),
+    path: z
+      .string()
+      .optional()
+      .describe("Relative path inside the folder, e.g. '/subfolder'"),
+    limit: z.number().optional().default(20).describe("Max items"),
+    offset: z.number().optional().default(0).describe("Offset"),
+    sort: z
+      .string()
+      .optional()
+      .describe("Sort field: name, created, modified, size. Prefix with '-' for desc"),
+  },
+  async ({ public_key, path, limit, offset, sort }) => {
+    const resource = await client.getPublicResource(public_key, { path, limit, offset, sort });
+    if (!resource._embedded) {
+      return textResult(formatResource(resource));
+    }
+    const items = resource._embedded.items.map(formatResource);
+    const header = `📂 ${resource.name}${path ? ` ${path}` : ""} (${resource._embedded.total} items, showing ${resource._embedded.offset + 1}–${resource._embedded.offset + items.length})`;
+    return textResult([header, "", ...items].join("\n"));
+  }
+);
+
+// ─── Tool: get_public_download_link ─────────────────────
+
+server.tool(
+  "get_public_download_link",
+  "Get a download link for a file (or a folder as zip) inside a shared/public folder",
+  {
+    public_key: z.string().describe("Public URL (https://yadi.sk/d/...) or public key"),
+    path: z
+      .string()
+      .optional()
+      .describe("Relative path of the file inside the folder, e.g. '/report.pdf'"),
+  },
+  async ({ public_key, path }) => {
+    const link = await client.getPublicDownloadLink(public_key, path);
+    return textResult(`⬇️ Download link${path ? ` for ${path}` : ""}:\n${link.href}`);
   }
 );
 
