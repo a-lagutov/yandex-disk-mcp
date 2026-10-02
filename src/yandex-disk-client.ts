@@ -62,8 +62,19 @@ export interface OperationStatus {
 export class YandexDiskClient {
   private token: string;
 
+  /** @param token - OAuth token; may be empty until the `login` tool is used */
   constructor(token: string) {
     this.token = token;
+  }
+
+  /** Replace the OAuth token (after a login), no restart needed. */
+  setToken(token: string): void {
+    this.token = token;
+  }
+
+  /** True if an OAuth token is available. */
+  hasToken(): boolean {
+    return this.token !== "";
   }
 
   private async request<T>(
@@ -75,6 +86,9 @@ export class YandexDiskClient {
     } = {}
   ): Promise<T> {
     const { method = "GET", params, body } = options;
+    if (!this.token) {
+      throw new Error("Not logged in to Yandex Disk — call the `login` tool first");
+    }
     // Absolute URLs (e.g. Yandex 360 API) are used as is, relative ones go to Disk API
     const url = new URL(path.startsWith("https://") ? path : `${API_BASE}${path}`);
     if (params) {
@@ -107,6 +121,9 @@ export class YandexDiskClient {
         errorMessage = errorJson.description || errorJson.message || errorBody;
       } catch {
         errorMessage = errorBody;
+      }
+      if (response.status === 401) {
+        throw new Error("Yandex token is invalid or expired — call the `login` tool");
       }
       // Yandex 360 API returns errors as { code, message }
       throw new Error(
