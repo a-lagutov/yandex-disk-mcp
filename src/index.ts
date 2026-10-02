@@ -673,14 +673,17 @@ server.tool(
   },
   async ({ query, folder, limit, iteration_key }) => {
     if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
-    const { resources, iterationKey } = await webClient.searchShared(query, {
+    const { resources, iterationKey, truncated } = await webClient.searchShared(query, {
       folder,
       limit,
       iterationKey: iteration_key,
     });
+    const truncatedNote = truncated
+      ? ["", "⚠️ Folder is large: the walk stopped early. Search in a subfolder, or without `folder` (server search, continue with iteration_key)."]
+      : [];
     if (resources.length === 0) {
       return textResult(
-        `Nothing found for "${query}"` +
+        `Nothing found for "${query}"` + (truncated ? " (walk stopped early — try a subfolder or search without `folder`)" : "") +
           (iterationKey
             ? ` yet — search is slow, not finished. Continue: iteration_key=${iterationKey}`
             : ".")
@@ -689,7 +692,7 @@ server.tool(
     const lines = await Promise.all(resources.map(formatSearchHit));
     const footer = iterationKey ? ["", `More: iteration_key=${iterationKey}`] : [];
     return textResult(
-      [`🔎 "${query}"${folder ? ` in ${folder}` : ""} (showing ${lines.length}):`, "", ...lines, ...footer].join("\n")
+      [`🔎 "${query}"${folder ? ` in ${folder}` : ""} (showing ${lines.length}):`, "", ...lines, ...footer, ...truncatedNote].join("\n")
     );
   }
 );
