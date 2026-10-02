@@ -53,15 +53,26 @@ export class YandexDiskWebClient {
   private origin: string | null = null;
   private sharedFoldersCache: { items: SharedResource[]; loadedAt: number } | null = null;
 
-  constructor(cookie: string) {
+  /**
+   * @param cookie - Cookie header value (may be empty if it will be fetched on demand)
+   * @param reloadCookie - called when the cookie is rejected; returns a fresh one or null
+   */
+  constructor(cookie: string, private reloadCookie?: () => Promise<string | null>) {
     this.cookie = cookie;
+  }
+
+  /** Replace the cookie (after a login), no restart needed. */
+  setCookie(cookie: string): void {
+    this.cookie = cookie;
+    this.sk = null;
+    this.origin = null;
   }
 
   /**
    * Load the web client page and extract the `sk` CSRF token and the actual host.
    * @throws if the cookie is invalid or expired (redirect to login page)
    */
-  private async refreshSession(): Promise<void> {
+  private async refreshSession(isRetry: boolean = false): Promise<void> {
     // Follow redirects manually: fetch drops the Cookie header on cross-origin
     // redirects (disk.yandex.ru → disk.360.yandex.ru for Yandex 360 accounts)
     let currentUrl = new URL(WEB_ENTRY_URL);
@@ -83,8 +94,16 @@ export class YandexDiskWebClient {
     }
     const finalUrl = currentUrl;
     if (finalUrl.hostname.startsWith("passport.")) {
+      // Try to get a fresh cookie automatically (headless Chrome profile) before giving up
+      if (!isRetry && this.reloadCookie) {
+        const freshCookie = await this.reloadCookie();
+        if (freshCookie) {
+          this.cookie = freshCookie;
+          return this.refreshSession(true);
+        }
+      }
       throw new Error(
-        "Yandex session cookie is invalid or expired — update YANDEX_SESSION_COOKIE"
+        "Yandex session cookie is invalid or expired — call the `login` tool to log in again"
       );
     }
     const html = await response.text();
