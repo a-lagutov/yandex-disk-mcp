@@ -49,6 +49,7 @@ export class YandexDiskWebClient {
   private sk: string | null = null;
   // Disk web host differs for Yandex 360 accounts (disk.360.yandex.ru), detected from redirect
   private origin: string | null = null;
+  private sharedFoldersCache: { items: SharedResource[]; loadedAt: number } | null = null;
 
   constructor(cookie: string) {
     this.cookie = cookie;
@@ -120,7 +121,8 @@ export class YandexDiskWebClient {
     });
 
     const text = await response.text();
-    let json: { error?: { statusCode?: number; title?: string; message?: string } } & T;
+    // Error is either an object ({ title, message }) or a bare code string ("UNKNOWN_ERROR")
+    let json: { error?: string | { statusCode?: number; title?: string; message?: string } } & T;
     try {
       json = JSON.parse(text);
     } catch {
@@ -133,7 +135,10 @@ export class YandexDiskWebClient {
         this.sk = null;
         return this.callModel<T>(apiMethod, requestParams, true);
       }
-      const description = json.error?.title ?? json.error?.message ?? text.slice(0, 200);
+      const description =
+        typeof json.error === "string"
+          ? json.error
+          : json.error?.title ?? json.error?.message ?? text.slice(0, 200);
       throw new Error(`Yandex Disk web API error ${response.status}: ${description}`);
     }
     return json;
@@ -162,4 +167,153 @@ export class YandexDiskWebClient {
       isPublicSavedLinks: "1",
     });
   }
+
+  // ─── Paths inside shared folders ──────────────────────
+
+  /**
+   * Fetch all shared folders (all pages), cached for a minute.
+   * Used to resolve human-readable paths like "ADV Team 2/Tasks".
+   */
+  private async getAllSharedFolders(): Promise<SharedResource[]> {
+    if (this.sharedFoldersCache && Date.now() - this.sharedFoldersCache.loadedAt < 60_000) {
+      return this.sharedFoldersCache.items;
+    }
+    const items: SharedResource[] = [];
+    let iterationKey: string | undefined;
+    // Safety cap on pages in case the API keeps returning the same key
+    for (let pageIndex = 0; pageIndex < 50; pageIndex++) {
+      const page = await this.getSharedResources("folders", { amount: 40, iterationKey });
+      items.push(...page.resources);
+      if (!page.iteration_key || page.resources.length < 40) break;
+      iterationKey = page.iteration_key;
+    }
+    this.sharedFoldersCache = { items, loadedAt: Date.now() };
+    return items;
+  }
+
+  /**
+   * Convert a user path to the internal web API path.
+   * Accepts "<shared folder name>/sub/path" or a raw internal path ("/aa/d_…/sub").
+   * @param userPath - path as given by the user
+   * @returns internal path without trailing slash, e.g. "/aa/d_b8g5…/Tasks"
+   */
+  async resolvePath(userPath: string): Promise<string> {
+    const trimmed = userPath.trim().replace(/\/+$/, "");
+    if (trimmed.startsWith("/aa/") || trimmed.startsWith("/disk/") || trimmed === "/disk") {
+      return trimmed;
+    }
+    const [folderName, ...rest] = trimmed.replace(/^\/+/, "").split("/");
+    const folders = await this.getAllSharedFolders();
+    const matches = folders.filter((folder) => folder.name.trim() === folderName.trim());
+    if (matches.length === 0) {
+      throw new Error(
+        `Shared folder "${folderName}" not found. Use list_shared_with_me to see available names.`
+      );
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `Several shared folders are named "${folderName}": ` +
+          matches.map((folder) => folder.path).join(", ") +
+          ". Use the internal path instead."
+      );
+    }
+    const basePath = matches[0].path.replace(/\/+$/, "");
+    return [basePath, ...rest].join("/");
+  }
+
+  // ─── Read / write inside shared folders ───────────────
+
+  /**
+   * List contents of a folder by internal path.
+   * @param path - internal path, e.g. "/aa/d_b8g5…/Tasks"
+   * @param options - page size and offset
+   */
+  async listFolder(
+    path: string,
+    options?: { amount?: number; offset?: number }
+  ): Promise<SharedResource[]> {
+    const folderId = `${path}/`;
+    const result = await this.callModel<{ resources: SharedResource[] }>("mpfs/resources", {
+      idContext: folderId,
+      sort: "name",
+      order: "1",
+      amount: Math.min(Math.max(options?.amount ?? 40, 1), 40),
+      offset: options?.offset ?? 0,
+    });
+    // The folder itself may come back as the first item — keep only children
+    return result.resources.filter((resource) => resource.id !== folderId);
+  }
+
+  /**
+   * Create a folder.
+   * @param path - internal path of the new folder
+   */
+  async createFolder(path: string): Promise<void> {
+    await this.callModel<Record<string, never>>("mpfs/mkdir", { path });
+  }
+
+  /**
+   * Start moving/renaming a resource; returns the async operation ID.
+   * @param from - internal source path
+   * @param to - internal destination path (full path including the new name)
+   * @param overwrite - replace an existing resource at the destination
+   */
+  async moveResource(from: string, to: string, overwrite: boolean = false): Promise<string> {
+    const operations = await this.callModel<BulkOperation[]>("mpfs/bulk-async-move", {
+      operations: [{ src: from, dst: to, force: overwrite ? 1 : 0 }],
+    });
+    return operations[0].oid;
+  }
+
+  /**
+   * Start moving a resource to trash; returns the async operation ID.
+   * @param path - internal path of the resource
+   */
+  async deleteResource(path: string): Promise<string> {
+    const operations = await this.callModel<BulkOperation[]>("mpfs/bulk-async-delete", {
+      operations: [{ src: path }],
+    });
+    return operations[0].oid;
+  }
+
+  /**
+   * Poll an async operation until it finishes or the timeout expires.
+   * @param oid - operation ID from moveResource / deleteResource
+   * @param timeoutMs - how long to wait before giving up
+   * @returns "done", "failed" or "in-progress" (timed out)
+   */
+  async waitForOperation(
+    oid: string,
+    timeoutMs: number = 15_000
+  ): Promise<"done" | "failed" | "in-progress"> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const statuses = await this.callModel<Record<string, BulkOperationStatus>>(
+        "mpfs/bulk-operation-status",
+        { oids: [oid] }
+      );
+      const status = statuses[oid];
+      // Observed finished state: { status: "DONE", state: "COMPLETED" }
+      if (status?.status === "DONE" || status?.state === "COMPLETED") return "done";
+      if (status?.status === "FAILED" || status?.state === "FAILED" || status?.error) {
+        return "failed";
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return "in-progress";
+  }
+}
+
+/** Async operation started by bulk-async-* methods. */
+interface BulkOperation {
+  oid: string;
+  type: string;
+}
+
+/** Status entry returned by mpfs/bulk-operation-status. */
+interface BulkOperationStatus {
+  status?: string;
+  state?: string;
+  type?: string;
+  error?: unknown;
 }
