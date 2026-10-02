@@ -2,7 +2,7 @@
 
 MCP-сервер для Яндекс Диска: свои файлы, публичные ссылки, корзина, **общие папки** (чтение и запись), загрузка локальных файлов. Работает с любым MCP-клиентом (Claude Code, Claude Desktop, Cursor и др.).
 
-Требуется **Node.js ≥ 20**.
+Требуется **Node.js ≥ 20** (для `login` — **≥ 22**).
 
 ## Инструменты (30)
 
@@ -10,7 +10,7 @@ MCP-сервер для Яндекс Диска: свои файлы, публи
 
 | Инструмент | Что делает |
 |---|---|
-| `login` | Вход через окно Chrome: cookie сессии + OAuth-токен, сохраняются сами |
+| `login` | Вход через окно браузера: cookie сессии + OAuth-токен, сохраняются сами |
 
 ### Свой Диск — официальный REST API
 
@@ -68,29 +68,36 @@ npm run build
 
 ## Вход
 
-Сервер запускается **без каких-либо настроек**. Когда нужен доступ, вызовите инструмент **`login`** (просто попросите Claude «войди в Яндекс Диск»):
+Сервер запускается **без каких-либо настроек**. Доступ даёт инструмент `login`:
 
-1. Откроется окно Chrome с **отдельным профилем** (`~/.config/yandex-disk-mcp/chrome-profile`) — войдите в Яндекс.
-2. В том же окне Яндекс выдаст OAuth-токен для вашего приложения (при первом входе нужно нажать «Разрешить»).
-3. Токен и cookie сессии сохраняются в `~/.config/yandex-disk-mcp/credentials.json` (права 600) и работают сразу, без перезапуска.
+- **Общие папки** — достаточно входа в Яндекс (cookie), OAuth-приложение не нужно.
+- **Свой Диск, публичные ссылки, корзина, загрузка** — нужен OAuth-токен, значит, и OAuth-приложение (создаётся один раз).
 
-Дальше всё автоматически: cookie общих папок, когда протухнет, обновляется в фоне из сохранённого профиля. Если сессия профиля тоже истекла — инструменты попросят снова вызвать `login`.
-
-Работает на любой ОС и в любой оболочке (zsh не нужен). Нужен любой браузер на Chromium: Chrome, Edge, Яндекс.Браузер, Brave, Vivaldi, Chromium (путь можно задать в `YANDEX_CHROME_PATH`), и Node.js ≥ 22. То же без Claude: `npm run login`.
-
-**Без такого браузера** (Firefox, Safari) войдите вручную: откройте `https://oauth.yandex.ru/authorize?response_type=token&client_id=<CLIENT_ID>` в любом браузере и скопируйте `access_token` из адресной строки; cookie — заголовок `Cookie` любого запроса `models-v2` на disk.yandex.ru (DevTools → Network). Передайте их в `login` (`token`, `cookie`) или `npm run login -- --token <T> --cookie <C>`. Автообновление cookie в этом режиме не работает.
-
-### OAuth-приложение (один раз)
+### 1. OAuth-приложение (один раз, только для своего Диска)
 
 1. https://oauth.yandex.ru → «Создать приложение».
 2. Платформа «Веб-сервисы», redirect URI: `https://oauth.yandex.ru/verification_code`.
 3. Доступы **Яндекс.Диск REST API**: `cloud_api:disk.read`, `cloud_api:disk.write`, `cloud_api:disk.info`.
    Необязательно, **API Яндекс 360**: `directory:read_organization`.
-4. Скопируйте Client ID и передайте при первом входе: «войди в Яндекс Диск, client_id …» (или `npm run login -- --client-id <ID>`). Он запоминается.
+4. Скопируйте Client ID — он понадобится при первом входе. Без него `login` получит только cookie: общие папки работают, свой Диск — нет.
 
 > Добавили право позже — вызовите `login` заново. Если право не добавилось, отзовите доступ приложения на https://id.yandex.ru/security и войдите ещё раз.
 
-> ⚠️ Cookie = полный доступ к аккаунту Яндекса, токен — к Диску. Файл `credentials.json` закрыт правами 600; не кладите его в репозиторий. Отдельный профиль Chrome изолирует сессию от основного браузера. Отозвать: https://id.yandex.ru/security → «Выйти на всех устройствах». Если нажать «Выйти» в профиле, cookie перестанет работать.
+### 2. Вход через `login`
+
+Попросите Claude: «войди в Яндекс Диск, client_id …» (Client ID запоминается, дальше его указывать не нужно). Только общие папки — «войди в Яндекс Диск» без `client_id`. То же без Claude: `npm run login -- --client-id <ID>`.
+
+1. Откроется окно браузера с **отдельным профилем** (`~/.config/yandex-disk-mcp/chrome-profile`) — войдите в Яндекс.
+2. В том же окне Яндекс выдаст OAuth-токен для вашего приложения (при первом входе нужно нажать «Разрешить»).
+3. Токен и cookie сессии сохраняются в `~/.config/yandex-disk-mcp/credentials.json` (права 600) и работают сразу, без перезапуска.
+
+Дальше всё автоматически: cookie общих папок, когда протухнет, обновляется в фоне из сохранённого профиля. Если сессия профиля тоже истекла — инструменты попросят снова вызвать `login`.
+
+Работает на любой ОС и в любой оболочке (zsh не нужен); на Windows `~` — это `C:\Users\<имя>`. Нужен любой браузер на Chromium: Chrome, Edge, Яндекс.Браузер, Brave, Vivaldi, Chromium (путь можно задать в `YANDEX_CHROME_PATH`), и Node.js ≥ 22.
+
+**Firefox и Safari** автоматический вход не поддерживают — только ручной режим. Войдите так: откройте `https://oauth.yandex.ru/authorize?response_type=token&client_id=<CLIENT_ID>` в любом браузере и скопируйте `access_token` из адресной строки; cookie — заголовок `Cookie` любого запроса `models-v2` на disk.yandex.ru (DevTools → Network). Передайте их в `login` (`token`, `cookie`) или `npm run login -- --token <T> --cookie <C>`. Автообновление cookie в этом режиме не работает.
+
+> ⚠️ Cookie = полный доступ к аккаунту Яндекса, токен — к Диску. Файл `credentials.json` закрыт правами 600; не кладите его в репозиторий. Отдельный профиль браузера изолирует сессию от основного. Отозвать: https://id.yandex.ru/security → «Выйти на всех устройствах». Если нажать «Выйти» в профиле, cookie перестанет работать.
 
 ### Переменные окружения (необязательно)
 
@@ -103,6 +110,8 @@ npm run build
 | `YANDEX_CLIENT_ID` | Client ID OAuth-приложения |
 | `YANDEX_ORG_ID` | ID организации Яндекс 360 для `list_shared_disks` |
 | `YANDEX_CHROME_PATH` | Путь к браузеру на Chromium, если он в нестандартном месте |
+
+> ⚠️ Переменная **перекрывает** сохранённое значение. Устаревший `YANDEX_DISK_TOKEN` или `YANDEX_SESSION_COOKIE` в окружении даст 401 даже после успешного `login` — удалите его (`unset`, правка `~/.zshenv` и т. п.).
 
 ## Подключение
 
@@ -130,7 +139,7 @@ claude mcp add yandex-disk --scope user -- node /path/to/yandex-disk-mcp/dist/in
 }
 ```
 
-Переменные не нужны — сервер сам предложит `login`.
+Переменные не нужны: если входа нет, инструмент ответит «call the `login` tool».
 
 ### Docker
 
@@ -139,7 +148,7 @@ docker build -t yandex-disk-mcp .
 docker run -i --rm -e YANDEX_DISK_TOKEN -e YANDEX_SESSION_COOKIE yandex-disk-mcp
 ```
 
-`-e VAR` без значения берёт его из текущего окружения. Через compose: `docker compose run --rm -T yandex-disk-mcp` (переменные из `.env`; `-T` отключает TTY, иначе он может сломать обмен по stdio).
+В контейнере нет браузера, поэтому `login` не работает и cookie сама не обновляется: возьмите токен и cookie вручную (см. «Вход») и обновляйте cookie, когда она истечёт. `-e VAR` без значения берёт значение из текущего окружения. Через compose: `docker compose run --rm -T yandex-disk-mcp` (переменные из `.env`; `-T` отключает TTY, иначе он может сломать обмен по stdio).
 
 > В контейнере `upload_file` и `shared_upload_file` видят только файлы контейнера — для загрузки с хоста примонтируйте папку (`-v ~/Uploads:/uploads`).
 
@@ -167,6 +176,9 @@ docker run -i --rm -e YANDEX_DISK_TOKEN -e YANDEX_SESSION_COOKIE yandex-disk-mcp
 
 - `src/yandex-disk-client.ts` — официальный REST API (`cloud-api.yandex.net/v1/disk`), OAuth-токен.
 - `src/yandex-disk-web-client.ts` — **недокументированный** API веб-версии (`disk.yandex.ru/models-v2`, для аккаунтов Яндекс 360 — `disk.360.yandex.ru`, хост определяется по редиректу), cookie + CSRF-токен `sk` со страницы Диска. Методы: `mpfs/resources`, `mpfs/mkdir`, `mpfs/bulk-async-move`, `mpfs/bulk-async-delete`, `mpfs/bulk-operation-status`, `mpfs/store`. Может сломаться без предупреждения.
+- `src/credentials.ts` — хранилище токена и cookie (`credentials.json`, права 600), переменные окружения перекрывают его.
+- `src/cookie-source.ts` — вход и обновление cookie через браузер на Chromium по протоколу DevTools (отдельный профиль), выдача OAuth-токена.
+- `src/login-cli.ts` — то же из терминала: `npm run login`.
 - `src/local-file.ts` — чтение локальных файлов потоком, хэши, PUT.
 
 Публичный REST API не отдаёт список «Общий доступ» и не умеет писать в чужие папки — поэтому веб-API.
