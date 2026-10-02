@@ -525,6 +525,100 @@ server.tool(
   }
 );
 
+// ─── Shared folders: read / write via web API ───────────
+
+const SHARED_PATH_DESCRIPTION =
+  "Path inside a shared folder: '<shared folder name>/sub/path' " +
+  "(e.g. 'ADV Team 2/Tasks 2026') or internal path ('/aa/d_…/sub')";
+
+const MISSING_COOKIE_MESSAGE =
+  "❌ YANDEX_SESSION_COOKIE is not set — shared folder operations need the web session cookie.";
+
+/**
+ * Describe the result of an async web operation for the user.
+ * @param action - what was done, e.g. "Moved: a → b"
+ * @param state - final state from waitForOperation
+ */
+function operationResult(action: string, state: "done" | "failed" | "in-progress") {
+  if (state === "done") return textResult(`✅ ${action}`);
+  if (state === "failed") return textResult(`❌ Failed: ${action}`);
+  return textResult(`⏳ Still in progress (large folder?): ${action}`);
+}
+
+server.tool(
+  "list_shared_folder",
+  "List contents of a folder shared with the user (including subfolders without public links). " +
+    "Requires YANDEX_SESSION_COOKIE.",
+  {
+    path: z.string().describe(SHARED_PATH_DESCRIPTION),
+    limit: z.number().optional().default(40).describe("Max items (1–40)"),
+    offset: z.number().optional().default(0).describe("Offset"),
+  },
+  async ({ path, limit, offset }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const internalPath = await webClient.resolvePath(path);
+    const items = await webClient.listFolder(internalPath, { amount: limit, offset });
+    if (items.length === 0) {
+      return textResult(`📂 ${path} is empty.`);
+    }
+    const lines = items.map((item) => `${item.type === "dir" ? "📁" : "📄"} ${item.name}`);
+    return textResult([`📂 ${path} (showing ${items.length}):`, "", ...lines].join("\n"));
+  }
+);
+
+server.tool(
+  "shared_create_folder",
+  "Create a folder inside a shared folder (needs write rights). Requires YANDEX_SESSION_COOKIE.",
+  {
+    path: z.string().describe(`${SHARED_PATH_DESCRIPTION} — of the new folder`),
+  },
+  async ({ path }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const internalPath = await webClient.resolvePath(path);
+    await webClient.createFolder(internalPath);
+    return textResult(`✅ Folder created: ${path}`);
+  }
+);
+
+server.tool(
+  "shared_move",
+  "Move or rename a file/folder inside shared folders (needs write rights). " +
+    "'to' is the full new path including the name. Requires YANDEX_SESSION_COOKIE.",
+  {
+    from: z.string().describe(SHARED_PATH_DESCRIPTION),
+    to: z.string().describe(`${SHARED_PATH_DESCRIPTION} — full destination path`),
+    overwrite: z.boolean().optional().default(false).describe("Overwrite if exists"),
+  },
+  async ({ from, to, overwrite }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const sourcePath = await webClient.resolvePath(from);
+    const destinationPath = await webClient.resolvePath(to);
+    const oid = await webClient.moveResource(sourcePath, destinationPath, overwrite);
+    const state = await webClient.waitForOperation(oid);
+    return operationResult(`Moved: ${from} → ${to}`, state);
+  }
+);
+
+server.tool(
+  "shared_delete",
+  "Delete a file/folder inside a shared folder (moves it to the owner's trash; needs write rights). " +
+    "Requires YANDEX_SESSION_COOKIE.",
+  {
+    path: z.string().describe(SHARED_PATH_DESCRIPTION),
+  },
+  async ({ path }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const internalPath = await webClient.resolvePath(path);
+    // Refuse to delete a whole shared folder root — too destructive for a path typo
+    if (/^\/aa\/[^/]+$/.test(internalPath)) {
+      return textResult(`❌ Refusing to delete the shared folder root itself: ${path}`);
+    }
+    const oid = await webClient.deleteResource(internalPath);
+    const state = await webClient.waitForOperation(oid);
+    return operationResult(`Moved to trash: ${path}`, state);
+  }
+);
+
 // ─── Tool: list_public_folder ───────────────────────────
 
 server.tool(
