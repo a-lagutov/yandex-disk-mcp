@@ -47,15 +47,15 @@ Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 | Tool | What it does |
 |---|---|
 | `list_shared_with_me` | The "Shared" section: folders/files, owner, rights, link. Next page via `iteration_key` from the response |
-| `shared_search` | Search by name across all shared folders, or inside one (`folder`). `exact` keeps only names that contain the query (the server search is fuzzy and returns similar words). Slow — see Limitations; next page via `iteration_key` |
+| `shared_search` | Search by name across all shared folders, or inside one (`folder`). `exact` keeps only names that contain the query (the server search is fuzzy and returns similar words). Slow — see Limitations; next page via `iteration_key`. With `folder` on an indexed folder the answer is local and instant (see [Index](#index)): `live` skips the index, `verify=false` skips the live check of the hits |
 | `list_shared_folder` | Shared folder contents (up to 40 at a time, then `offset`) |
 | `shared_create_folder` | Create a folder |
 | `shared_move` | Move / rename |
 | `shared_copy` | Copy (same destination rules as `shared_move`) |
 | `shared_delete` | Delete (to the owner's trash). A shared folder root cannot be deleted |
 | `shared_upload_file` | Upload a local file |
-| `index_shared` | Build a local name index of a shared folder's whole tree in the background (minutes for big trees). Afterwards `shared_search` with that folder answers instantly, ignoring case and punctuation (`prod9514` finds `PROD-9514`). On an indexed folder it runs a cheap update instead (`refresh=true` rebuilds from scratch) |
-| `index_status` | Running builds and saved indexes, Folder sync state |
+| `index_shared` | Build a local name index of a shared folder's whole tree in the background (minutes for big trees). Afterwards `shared_search` with that folder answers instantly, ignoring case and punctuation (`prod9514` finds `PROD-9514`). On an indexed folder it runs a cheap update instead (`refresh=true` rebuilds from scratch). See [Index](#index) |
+| `index_status` | Running builds and saved indexes, folder sync state |
 | `index_sync` | Sync indexes through the indexed folders now (runs by itself too, see Limitations) |
 
 ### Yandex 360 for business
@@ -177,25 +177,52 @@ The shared folder name is as in `list_shared_with_me`. A destination path ending
 - "Show the contents of ADV Team 2/Tasks 2026"
 - "Create the folder ADV Team 2/Tasks 2026/New project"
 - "Upload ~/Desktop/report.pdf to ADV Team 2/Tasks 2026/"
+- "Index ADV Team 2/Tasks 2026"
+- "Find prod9514 in ADV Team 2/Tasks 2026"
 - "Make disk:/photo.jpg public and give me the link"
 - "What is in the trash? Restore the last deleted file"
 
 ## How it works
 
 - `src/yandex-disk-client.ts` — official REST API (`cloud-api.yandex.net/v1/disk`), OAuth token.
-- `src/yandex-disk-web-client.ts` — **undocumented** web API (`disk.yandex.ru/models-v2`, for Yandex 360 accounts `disk.360.yandex.ru`, the host is detected from the redirect), cookie + the `sk` CSRF token from the Disk page. Methods: `mpfs/resources`, `mpfs/mkdir`, `mpfs/bulk-async-move`, `mpfs/bulk-async-copy`, `mpfs/bulk-async-delete`, `mpfs/bulk-operation-status`, `mpfs/store`. May break without notice.
+- `src/yandex-disk-web-client.ts` — **undocumented** web API (`disk.yandex.ru/models-v2`, for Yandex 360 accounts `disk.360.yandex.ru`, the host is detected from the redirect), cookie + the `sk` CSRF token from the Disk page. Methods: `mpfs/resources`, `mpfs/mkdir`, `mpfs/bulk-async-move`, `mpfs/bulk-async-copy`, `mpfs/bulk-async-delete`, `mpfs/bulk-operation-status`, `mpfs/store`, `mpfs/url`, `mpfs/dir-size`, `intapi/journal`. May break without notice.
 - `src/credentials.ts` — token and cookie store (`credentials.json`, mode 600); environment variables override it.
 - `src/cookie-source.ts` — login and cookie refresh through a Chromium-based browser over the DevTools protocol (separate profile), OAuth token issue.
 - `src/login-cli.ts` — the same from a terminal: `npm run login`.
 - `src/local-file.ts` — streaming reads of local files, hashes, PUT.
+- `src/shared-index.ts` — local name index of shared folders: build, search, keeping it fresh.
+- `src/index-sync.ts` — sharing the index through the indexed folder.
 
 The public REST API does not return the "Shared" list and cannot write to other people's folders — hence the web API.
+
+## Index
+
+`index_shared` walks a shared folder's whole tree once (about 20 folders per second) and keeps the names in a local file, `~/.config/yandex-disk-mcp/index/`. After that `shared_search` with `folder` answers from it in milliseconds, ignoring case and punctuation (`prod9514` finds `PROD-9514`), without the fuzzy noise of the server search.
+
+### Freshness
+
+The index is corrected without a full rebuild:
+
+1. **Verify on read.** Every indexed search re-lists the parent folders of its hits and fixes the index before answering (`verify=false` skips it). Renames are recognised by the item's stable `file_id`.
+2. **Update.** `index_shared` on an indexed folder (and automatically once a day) first re-lists folders named in the change journal of your Disk (your own changes from any device), then compares folder size signatures (`mpfs/dir-size`) and re-lists only the changed folders. The first update of an index only records the signatures and trusts the current contents.
+3. **Rotation.** After searches, a background pass re-lists the 200 stalest folders. This catches renames and new empty folders, which size signatures miss.
+4. **Fallback.** An empty indexed result is repeated as a live server search.
+
+The journal holds only your own changes. Other people's changes are found by verify, signatures and rotation. `refresh=true` rebuilds the whole index.
+
+### Sharing
+
+Each index is also stored as `.yandex-disk-mcp-index.json.gz` in the **root of the indexed folder**. Everyone who uses that folder with this server shares one index: the first person builds it, the others download it instead of walking the tree.
+
+- ⚠️ A visible file appears in the folder root for all its members. It lists names, sizes and dates of the whole tree — what members already see. Uploading needs the `write` right.
+- Sync runs first — before a build and on the first indexed search — and again after a build or fixes. The newer version wins; the other copy is kept as `.bak` next to the local index. Unfinished builds are never uploaded. Indexing skips the file itself.
+- `YANDEX_INDEX_SYNC=off` turns sharing off.
 
 ## Limitations
 
 - Search (`shared_search`, `search_files` with `query`) is the web client's own search and is slow on Yandex's side: 2–11 s per page of 20. A query in double quotes (`"PROD-9514"`) searches whole words only: pages take ~0.5 s instead of 2–10 s and carry no noise, but names that merely start with the query (`PROD-9514_out`) are missed. Several pages are fetched in parallel; one call stops after about 30 s and returns an `iteration_key` to continue.
-- The server cannot limit the search to one shared folder, so with `folder` the tree is walked with fast folder listings (about 16 folders per second, found by name substring). Huge trees (thousands of folders) do not fit into one call: the answer carries an `iteration_key` — pass it back to continue where the walk stopped (the folder is remembered; kept in server memory for 30 minutes). Narrowing `folder` to a subfolder is much faster.
-- Indexes (`index_shared`) are kept fresh without a rebuild: (1) every indexed search re-lists the parent folders of its hits and fixes the index before answering (`verify=false` skips it); renames are recognised by the item's stable `file_id`; (2) an update (`index_shared` on an indexed folder, and automatically once a day) first re-lists folders named in your Disk journal (your own changes from any device), then compares folder size signatures (`mpfs/dir-size`) and re-lists only changed folders — the first update after upgrading just records signatures and trusts the current contents; (3) a background rotation re-lists the 200 stalest folders after searches, which catches renames and new empty folders that size signatures miss; (4) an empty indexed result falls back to the live server search. Other people's changes are found by (1), (2) and (3), not by the journal. `refresh=true` rebuilds fully. Each index is also stored as `.yandex-disk-mcp-index.json.gz` in the **root of the indexed folder**, so everyone who uses that folder with this server shares one index: the first person builds it, the others download it instead of walking the tree (it is skipped by indexing, and uploading needs the `write` right). The file lists names, sizes and dates of the whole tree — what any member of the folder already sees. Sync runs first — before a build and on the first indexed search — and again after a build or fixes; the newer version wins and the other copy is kept as `.bak` next to the local index. Unfinished builds are never uploaded. `YANDEX_INDEX_SYNC=off` turns it off.
+- The server cannot limit the search to one shared folder, so with `folder` the tree is walked with fast folder listings (about 20 folders per second, found by name substring). Huge trees (thousands of folders) do not fit into one call: the answer carries an `iteration_key` — pass it back to continue where the walk stopped (the folder is remembered; kept in server memory for 30 minutes). Narrowing `folder` to a subfolder is much faster.
+- An index is a snapshot kept close to the real tree, not a live view: changes by other people show up after the next verify, update or rotation (see [Index](#index)); the Disk journal lags by a few seconds.
 - Writing to a read-only shared folder — the error format is not verified.
 - `list_shared_folder` returns up to 40 items per request — use `offset` for more.
 - Move/delete waits up to 15 s; for large folders it returns "in progress" and the operation continues on Yandex's side.
