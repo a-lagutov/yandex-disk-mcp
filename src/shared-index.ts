@@ -17,6 +17,14 @@ import type { SharedResource, YandexDiskWebClient } from "./yandex-disk-web-clie
 const INDEX_DIR = join(CONFIG_DIR, "index");
 const BUILD_CONCURRENCY = 8;
 const CHECKPOINT_INTERVAL_MS = 30_000;
+/** Folders deeper than this have no stored signature: a changed parent re-lists them */
+const SIGNATURE_DEPTH = 4;
+const VERIFY_MAX_FOLDERS = 20;
+const ROTATION_BATCH = 200;
+const ROTATION_PAUSE_MS = 10 * 60_000;
+const STALE_AFTER_MS = 24 * 60 * 60_000;
+const JOURNAL_MARGIN_MS = 5 * 60_000;
+const PUSH_DELAY_MS = 10 * 60_000;
 
 /** One indexed item; `isDir` and the other fields mirror what listings return. */
 interface IndexEntry {
@@ -33,11 +41,18 @@ export interface IndexFile {
   rootDisplay: string;
   startedAt: string;
   builtAt: string | null;
+  /** Last time the contents were corrected by an update, a verify or a rotation */
+  updatedAt?: string;
   queue: string[];
-  entries: [string, string, number, number, number][];
+  /** [name, path, isDir, size, mtime, fid] — `fid` is the first 16 hex chars of file_id (absent in old files) */
+  entries: [string, string, number, number, number, string?][];
+  /** Folder path → [size, filesCount] from the last smart update (cheap change signature) */
+  sigs?: Record<string, [number, number]>;
+  /** Folder path → epoch ms of its last re-listing (rotation takes the stalest first) */
+  reconciledAt?: Record<string, number>;
 }
 
-interface LoadedIndex {
+export interface LoadedIndex {
   file: IndexFile;
   /** Names without punctuation and case, parallel to `file.entries`. */
   normalizedNames: string[];
@@ -53,6 +68,18 @@ interface BuildJob {
   queueLength: number;
   error: string | null;
   isFinished: boolean;
+  kind?: "build" | "update";
+  /** Outcome text of a finished update */
+  summary?: string;
+}
+
+/** What a reconcile changed in the index. */
+export interface ReconcileStats {
+  folders: number;
+  added: number;
+  removed: number;
+  renamed: number;
+  changed: number;
 }
 
 /** Lower-case a text and drop everything but letters and digits. */
@@ -77,6 +104,8 @@ export interface IndexSummary {
   rootDisplay: string;
   /** Null while the build is unfinished */
   builtAt: string | null;
+  /** Newest change of the contents: what sync compares */
+  version: string | null;
   /** True while a build of this root is running */
   isBuilding: boolean;
 }
@@ -93,6 +122,11 @@ export class SharedIndex {
   private jobs = new Map<string, BuildJob>();
   /** Called after a build finished successfully (used to push the index to the Disk). */
   onBuilt: ((root: string) => void) | null = null;
+  private pushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Roots with a background update or rotation running */
+  private maintenance = new Set<string>();
+  private lastRotationAt = new Map<string, number>();
+  private updateAttempted = new Set<string>();
 
   constructor(private webClient: YandexDiskWebClient) {
     this.loadFromDisk();
@@ -127,9 +161,8 @@ export class SharedIndex {
       return `⏳ Already indexing ${folder}. See index_status.`;
     }
     const existing = this.indexes.get(root);
-    if (existing && existing.file.builtAt && !refresh) {
-      return `✅ ${folder} is already indexed (${existing.file.entries.length} items, ${existing.file.builtAt}). Use refresh=true to rebuild.`;
-    }
+    // An existing complete index gets a cheap update; refresh=true walks the tree again
+    if (existing && existing.file.builtAt && !refresh) return this.startUpdate(root);
     const resumeFrom = !refresh && existing && !existing.file.builtAt ? existing.file : null;
     const rootDisplay = await this.webClient.toDisplayPath(root);
     const job: BuildJob = {
@@ -196,6 +229,7 @@ export class SharedIndex {
             item.type === "dir" ? 1 : 0,
             item.meta?.size ?? 0,
             item.mtime ?? 0,
+            item.meta?.file_id?.slice(0, 16) ?? "",
           ]);
           if (item.type === "dir") queue.push(itemPath);
         }
@@ -252,6 +286,7 @@ export class SharedIndex {
       root: file.root,
       rootDisplay: file.rootDisplay,
       builtAt: file.builtAt,
+      version: file.builtAt ? (file.updatedAt ?? file.builtAt) : null,
       isBuilding: this.jobs.get(file.root)?.isFinished === false,
     }));
   }
@@ -287,11 +322,346 @@ export class SharedIndex {
     return file;
   }
 
+
+  // ─── Freshness: keep the snapshot close to the real tree ──────────────
+
+  /** Result counters of a reconcile. */
+  private static emptyStats(): ReconcileStats {
+    return { folders: 0, added: 0, removed: 0, renamed: 0, changed: 0 };
+  }
+
+  /** Parent path of an internal path. */
+  private static parentOf(path: string): string {
+    return path.slice(0, path.lastIndexOf("/"));
+  }
+
+  /** Rebuild lookup data after entries changed, bump the version, save, schedule a sync push. */
+  private commit(loaded: LoadedIndex): void {
+    loaded.normalizedNames = loaded.file.entries.map((entry) => normalizeName(entry[0]));
+    loaded.file.updatedAt = new Date().toISOString();
+    writeFileAtomically(indexFilePath(loaded.file.root), JSON.stringify(loaded.file));
+    // Many small fixes make one push, not one push each
+    if (!this.pushTimer && this.onBuilt) {
+      this.pushTimer = setTimeout(() => {
+        this.pushTimer = null;
+        this.onBuilt?.(loaded.file.root);
+      }, PUSH_DELAY_MS);
+      this.pushTimer.unref();
+    }
+  }
+
+  /** Every listed child of a folder, all pages. Returns null when the folder is gone. */
+  private async listAllChildren(folderPath: string): Promise<SharedResource[] | null> {
+    const children: SharedResource[] = [];
+    try {
+      for (let offset = 0; ; offset += 40) {
+        const { items, rawCount } = await this.webClient.listFolderPage(folderPath, { amount: 40, offset });
+        children.push(...items);
+        if (rawCount < 40) break;
+      }
+    } catch (error) {
+      if (/\b404\b|not.?found/i.test((error as Error).message)) return null;
+      throw error;
+    }
+    return children;
+  }
+
+  /** Walk new folders and return their whole subtree as entries (no index mutation). */
+  private async walkNewFolders(startPaths: string[]): Promise<IndexFile["entries"]> {
+    const found: IndexFile["entries"] = [];
+    const queue = [...startPaths];
+    let active = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const folderPath = queue.shift();
+        if (folderPath === undefined) {
+          if (active === 0) return;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          continue;
+        }
+        active++;
+        try {
+          for (const item of (await this.listAllChildren(folderPath)) ?? []) {
+            const itemPath = item.path.replace(/\/+$/, "");
+            found.push([item.name.trim(), itemPath, item.type === "dir" ? 1 : 0, item.meta?.size ?? 0, item.mtime ?? 0, item.meta?.file_id?.slice(0, 16) ?? ""]);
+            if (item.type === "dir") queue.push(itemPath);
+          }
+        } finally {
+          active--;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: BUILD_CONCURRENCY }, worker));
+    return found;
+  }
+
+  /**
+   * Re-list one folder and correct its direct children in the index: new items are added
+   * (new folders are walked), missing ones removed with their subtree, renamed ones
+   * (same file_id, new name) are renamed and their subtree paths rewritten.
+   * Does not save: the caller commits when a batch is done.
+   */
+  private async reconcileFolder(loaded: LoadedIndex, folderPath: string, stats: ReconcileStats): Promise<void> {
+    const listed = await this.listAllChildren(folderPath);
+    const { file } = loaded;
+    stats.folders++;
+    file.reconciledAt ??= {};
+    file.reconciledAt[folderPath] = Date.now();
+
+    // The folder no longer exists: drop it and everything under it
+    if (listed === null) {
+      const before = file.entries.length;
+      file.entries = file.entries.filter(([, path]) => path !== folderPath && !path.startsWith(`${folderPath}/`));
+      stats.removed += before - file.entries.length;
+      return;
+    }
+
+    const knownByPath = new Map<string, number>();
+    file.entries.forEach((entry, position) => {
+      if (SharedIndex.parentOf(entry[1]) === folderPath) knownByPath.set(entry[1], position);
+    });
+    const listedPaths = new Set(listed.map((item) => item.path.replace(/\/+$/, "")));
+    // Known children that disappeared by path: candidates for a rename, matched by file_id
+    const vanishedByFid = new Map<string, number>();
+    for (const [path, position] of knownByPath) {
+      const fid = file.entries[position][5];
+      if (!listedPaths.has(path) && fid) vanishedByFid.set(fid, position);
+    }
+
+    const newFolders: string[] = [];
+    const additions: IndexFile["entries"] = [];
+    const renamedFrom = new Set<number>();
+    for (const item of listed) {
+      const itemPath = item.path.replace(/\/+$/, "");
+      const fid = item.meta?.file_id?.slice(0, 16) ?? "";
+      const isDir = item.type === "dir" ? 1 : 0;
+      const size = item.meta?.size ?? 0;
+      const position = knownByPath.get(itemPath);
+      if (position !== undefined) {
+        const entry = file.entries[position];
+        if (entry[3] !== size || entry[4] !== (item.mtime ?? 0) || entry[0] !== item.name.trim() || entry[5] !== fid) {
+          stats.changed++;
+        }
+        file.entries[position] = [item.name.trim(), itemPath, isDir, size, item.mtime ?? 0, fid];
+        continue;
+      }
+      const renamedPosition = fid ? vanishedByFid.get(fid) : undefined;
+      if (renamedPosition !== undefined) {
+        const oldPath = file.entries[renamedPosition][1];
+        renamedFrom.add(renamedPosition);
+        stats.renamed++;
+        file.entries[renamedPosition] = [item.name.trim(), itemPath, isDir, size, item.mtime ?? 0, fid];
+        // A renamed folder carries its subtree: rewrite the paths below it
+        if (isDir) {
+          for (const entry of file.entries) {
+            if (entry[1].startsWith(`${oldPath}/`)) entry[1] = itemPath + entry[1].slice(oldPath.length);
+          }
+        }
+        continue;
+      }
+      stats.added++;
+      additions.push([item.name.trim(), itemPath, isDir, size, item.mtime ?? 0, fid]);
+      if (isDir) newFolders.push(itemPath);
+    }
+
+    // Still unmatched known children are gone: drop them and their subtrees
+    const removedPaths = [...knownByPath.entries()]
+      .filter(([path, position]) => !listedPaths.has(path) && !renamedFrom.has(position))
+      .map(([path]) => path);
+    if (removedPaths.length) {
+      const gone = new Set(removedPaths);
+      const before = file.entries.length;
+      file.entries = file.entries.filter(([, path]) => {
+        if (gone.has(path)) return false;
+        return !removedPaths.some((prefix) => path.startsWith(`${prefix}/`));
+      });
+      stats.removed += before - file.entries.length;
+    }
+
+    file.entries.push(...additions);
+    if (newFolders.length) {
+      const subtree = await this.walkNewFolders(newFolders);
+      stats.added += subtree.length;
+      file.entries.push(...subtree);
+    }
+  }
+
+  /**
+   * Run `step` over items with a few at a time.
+   */
+  private async forEachParallel<T>(items: T[], step: (item: T) => Promise<void>): Promise<void> {
+    const pending = [...items];
+    await Promise.all(
+      Array.from({ length: Math.min(BUILD_CONCURRENCY, pending.length) }, async () => {
+        while (pending.length) await step(pending.shift()!);
+      })
+    );
+  }
+
+  /**
+   * Check the parent folders of search hits against the live tree and fix the index.
+   * @returns what changed; all zeros when the index was right
+   */
+  async verifyParents(loaded: LoadedIndex, hits: SharedResource[]): Promise<ReconcileStats> {
+    const stats = SharedIndex.emptyStats();
+    const parents = [...new Set(hits.map((hit) => SharedIndex.parentOf(hit.path)))].slice(0, VERIFY_MAX_FOLDERS);
+    await this.forEachParallel(parents, (parent) => this.reconcileFolder(loaded, parent, stats));
+    if (stats.added || stats.removed || stats.renamed || stats.changed) this.commit(loaded);
+    return stats;
+  }
+
+  /**
+   * Re-list the stalest folders of an index (background, one run per root at a time).
+   * Catches what size signatures cannot: renames and new empty folders.
+   */
+  private async rotate(loaded: LoadedIndex): Promise<void> {
+    const root = loaded.file.root;
+    if (this.maintenance.has(root)) return;
+    this.maintenance.add(root);
+    try {
+      const stats = SharedIndex.emptyStats();
+      const builtTime = Date.parse(loaded.file.builtAt ?? "") || 0;
+      const reconciledAt = loaded.file.reconciledAt ?? {};
+      const folders = [root, ...loaded.file.entries.filter((entry) => entry[2] === 1).map((entry) => entry[1])];
+      const stalest = folders
+        .sort((first, second) => (reconciledAt[first] ?? builtTime) - (reconciledAt[second] ?? builtTime))
+        .slice(0, ROTATION_BATCH);
+      await this.forEachParallel(stalest, (folder) => this.reconcileFolder(loaded, folder, stats));
+      this.commit(loaded);
+    } catch {
+      // Rotation is best effort: the next search tries again
+    } finally {
+      this.maintenance.delete(root);
+    }
+  }
+
+  /**
+   * Background upkeep triggered by a search on an index: rotate when the last rotation is
+   * old, run a smart update when the whole index is older than a day.
+   */
+  scheduleUpkeep(loaded: LoadedIndex): void {
+    const root = loaded.file.root;
+    if (this.maintenance.has(root) || this.isBuilding(root)) return;
+    const version = Date.parse(loaded.file.updatedAt ?? loaded.file.builtAt ?? "") || 0;
+    if (Date.now() - version > STALE_AFTER_MS && !this.updateAttempted.has(root)) {
+      this.updateAttempted.add(root);
+      void this.startUpdate(root).catch(() => undefined);
+      return;
+    }
+    if (Date.now() - (this.lastRotationAt.get(root) ?? 0) > ROTATION_PAUSE_MS) {
+      this.lastRotationAt.set(root, Date.now());
+      void this.rotate(loaded);
+    }
+  }
+
+  /**
+   * Smart update in the background: compare folder size signatures (one cheap call per
+   * folder) and re-list only the folders whose signature changed. The first run on an
+   * index without signatures records them and trusts the current contents.
+   * @param root - internal root path of an existing complete index
+   */
+  async startUpdate(root: string): Promise<string> {
+    const loaded = this.indexes.get(root);
+    if (!loaded?.file.builtAt) return "No complete index to update — use index_shared to build one.";
+    if (this.isBuilding(root) || this.maintenance.has(root)) return `⏳ ${loaded.file.rootDisplay}: already working. See index_status.`;
+    const job: BuildJob = {
+      root,
+      rootDisplay: loaded.file.rootDisplay,
+      startedAt: Date.now(),
+      foldersVisited: 0,
+      entryCount: loaded.file.entries.length,
+      queueLength: 0,
+      error: null,
+      isFinished: false,
+      kind: "update",
+      summary: "",
+    };
+    this.jobs.set(root, job);
+    this.maintenance.add(root);
+    void this.runUpdate(loaded, job)
+      .catch((error: Error) => {
+        job.error = error.message;
+      })
+      .finally(() => {
+        job.isFinished = true;
+        this.maintenance.delete(root);
+      });
+    return `⏳ Updating ${loaded.file.rootDisplay} in the background (changed folders only). Check index_status.`;
+  }
+
+  /** The signature walk of a smart update. */
+  private async runUpdate(loaded: LoadedIndex, job: BuildJob): Promise<void> {
+    const { file } = loaded;
+    const stats = SharedIndex.emptyStats();
+    const isBaseline = !file.sigs || Object.keys(file.sigs).length === 0;
+    file.sigs ??= {};
+    const sigs = file.sigs;
+    let checked = 0;
+
+    const check = async (folderPath: string, depth: number): Promise<void> => {
+      job.queueLength++;
+      const { size, filesCount } = await this.webClient.getDirSize(folderPath).catch(() => ({ size: -1, filesCount: -1 }));
+      job.queueLength--;
+      checked++;
+      job.foldersVisited = checked;
+      const previous = sigs[folderPath];
+      if (size >= 0) sigs[folderPath] = [size, filesCount];
+      const isUnchanged = !!previous && size >= 0 && previous[0] === size && previous[1] === filesCount;
+      if (isUnchanged) return; // the whole subtree is the same: prune
+      // Baseline: trust the index, only record signatures downwards
+      if (!(isBaseline && previous === undefined)) await this.reconcileFolder(loaded, folderPath, stats);
+      const childDirs = loaded.file.entries
+        .filter((entry) => entry[2] === 1 && SharedIndex.parentOf(entry[1]) === folderPath)
+        .map((entry) => entry[1]);
+      if (depth < SIGNATURE_DEPTH) {
+        await this.forEachParallel(childDirs, (childPath) => check(childPath, depth + 1));
+      } else if (!isBaseline) {
+        // Below the signature depth nothing is stored: re-list the whole subtree of a changed folder
+        await this.forEachParallel(childDirs, async (childPath) => {
+          const stack = [childPath];
+          while (stack.length) {
+            const current = stack.pop()!;
+            await this.reconcileFolder(loaded, current, stats);
+            stack.push(...loaded.file.entries.filter((entry) => entry[2] === 1 && SharedIndex.parentOf(entry[1]) === current).map((entry) => entry[1]));
+          }
+        });
+      }
+    };
+
+    // Journal first: the user's own recent changes name the folders to re-list directly
+    let journalFolders: string[] = [];
+    try {
+      // A margin covers clock skew and the journal's own delay; re-listing an extra folder is cheap
+      const since = (Date.parse(file.updatedAt ?? file.builtAt ?? "") || 0) - JOURNAL_MARGIN_MS;
+      journalFolders = (await this.webClient.getJournalFolders(since)).filter(
+        (folder) => folder === file.root || folder.startsWith(`${file.root}/`)
+      );
+      await this.forEachParallel(journalFolders, (folder) => this.reconcileFolder(loaded, folder, stats));
+    } catch {
+      // The journal is an extra signal: signatures below still find the changes
+    }
+
+    await check(loaded.file.root, 0);
+    this.commit(loaded);
+    job.entryCount = loaded.file.entries.length;
+    job.summary = isBaseline
+      ? `signatures recorded for ${checked} folders (first run trusts the current contents)`
+      : `${journalFolders.length} folders from the journal, ${stats.folders} folders re-listed: +${stats.added} −${stats.removed} renamed ${stats.renamed} changed ${stats.changed}`;
+  }
+
   /** Text for index_status: running builds and saved indexes. */
   describe(): string {
     const lines: string[] = [];
     for (const job of this.jobs.values()) {
       const seconds = Math.round((Date.now() - job.startedAt) / 1000);
+      if (job.kind === "update") {
+        lines.push(
+          job.isFinished
+            ? `${job.error ? "❌" : "✅"} ${job.rootDisplay}: update ${job.error ? `stopped (${job.error})` : `finished — ${job.summary}`}, ${seconds}s`
+            : `🔄 ${job.rootDisplay}: updating, ${job.foldersVisited} folders checked, ${seconds}s`
+        );
+        continue;
+      }
       lines.push(
         job.isFinished
           ? `${job.error ? "❌" : "✅"} ${job.rootDisplay}: build ${job.error ? `stopped (${job.error}); start index_shared again to resume` : "finished"}, ${seconds}s`
@@ -302,7 +672,7 @@ export class SharedIndex {
       if (this.jobs.get(file.root) && !this.jobs.get(file.root)!.isFinished) continue;
       lines.push(
         file.builtAt
-          ? `📚 ${file.rootDisplay}: ${file.entries.length} items, built ${file.builtAt}`
+          ? `📚 ${file.rootDisplay}: ${file.entries.length} items, built ${file.builtAt}${file.updatedAt ? `, updated ${file.updatedAt}` : ""}`
           : `⚠️ ${file.rootDisplay}: incomplete (${file.entries.length} items, ${file.queue.length} folders left) — run index_shared to resume`
       );
     }

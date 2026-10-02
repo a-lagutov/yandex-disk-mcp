@@ -700,9 +700,14 @@ server.tool(
       .optional()
       .default(false)
       .describe("Skip the local index of `folder` (see index_shared) and search the server"),
+    verify: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Index search only: re-list the parent folders of the hits and fix the index first"),
     iteration_key: z.string().optional().describe("Continuation key from the previous answer"),
   },
-  async ({ query, folder, limit, exact, live, iteration_key }) => {
+  async ({ query, folder, limit, exact, live, verify, iteration_key }) => {
     if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
     // A finished local index of the folder answers in milliseconds, without fuzzy noise
     if (folder && !live) {
@@ -712,19 +717,41 @@ server.tool(
       const indexed = sharedIndex.findCovering(folderPath);
       if (indexed) {
         const offset = iteration_key?.startsWith("idx:") ? Number(iteration_key.slice(4)) : 0;
-        const { resources, nextOffset } = sharedIndex.search(indexed, folderPath, query, limit, offset);
-        if (resources.length === 0) {
-          return textResult(`Nothing found for "${query}" in the index of ${folder} (built ${indexed.file.builtAt}).`);
+        let { resources, nextOffset } = sharedIndex.search(indexed, folderPath, query, limit, offset);
+        // Verify on read: re-list the hits' parent folders and fix the index before answering
+        let verifyNote = "";
+        if (verify && resources.length > 0) {
+          try {
+            const stats = await sharedIndex.verifyParents(indexed, resources);
+            const fixes = stats.added + stats.removed + stats.renamed + stats.changed;
+            if (fixes > 0) {
+              ({ resources, nextOffset } = sharedIndex.search(indexed, folderPath, query, limit, offset));
+              verifyNote = ` Verified ${stats.folders} folders live, fixed ${fixes} stale items.`;
+            } else {
+              verifyNote = ` Verified ${stats.folders} folders live.`;
+            }
+          } catch {
+            verifyNote = " Live verification failed, showing the snapshot.";
+          }
         }
-        const indexedLines = await Promise.all(resources.map(formatSearchHit));
-        return textResult(
-          [
-            `🔎 "${query}" in ${folder} — local index, built ${indexed.file.builtAt} (showing ${indexedLines.length}):`,
-            "",
-            ...indexedLines,
-            ...(nextOffset !== null ? ["", `More: iteration_key=idx:${nextOffset}`] : []),
-          ].join("\n")
-        );
+        // Keep the index fresh in the background (rotation, daily smart update)
+        sharedIndex.scheduleUpkeep(indexed);
+        // Nothing in the index on the first page: the snapshot may be stale, ask the server too
+        if (resources.length > 0 || offset > 0) {
+          const indexedLines = await Promise.all(resources.map(formatSearchHit));
+          if (indexedLines.length === 0) {
+            return textResult(`Nothing found for "${query}" in the index of ${folder}.`);
+          }
+          return textResult(
+            [
+              `🔎 "${query}" in ${folder} — local index, built ${indexed.file.builtAt}${indexed.file.updatedAt ? `, updated ${indexed.file.updatedAt}` : ""} (showing ${indexedLines.length}).${verifyNote}`,
+              "",
+              ...indexedLines,
+              ...(nextOffset !== null ? ["", `More: iteration_key=idx:${nextOffset}`] : []),
+            ].join("\n")
+          );
+        }
+        // Falls through to the live server search below
       }
     }
     const { resources, iterationKey } = await webClient.searchShared(query, {
@@ -754,7 +781,8 @@ server.tool(
   "Build a local name index of a shared folder (its whole tree) in the background. Afterwards " +
     "shared_search with that folder is instant, ignores punctuation and case (\"prod9514\" finds " +
     "\"PROD-9514\") and has no fuzzy noise. Takes minutes for big trees; progress in index_status. " +
-    "The index is a snapshot: rebuild with refresh=true. An interrupted build is resumed.",
+    "With an existing index it runs a cheap update (changed folders only, found by size signatures); " +
+    "refresh=true walks the whole tree again. An interrupted build is resumed.",
   {
     folder: z.string().describe(SHARED_PATH_DESCRIPTION),
     refresh: z.boolean().optional().default(false).describe("Rebuild from scratch"),
