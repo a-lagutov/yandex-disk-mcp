@@ -62,6 +62,8 @@ export interface SharedResource {
     public_hash?: string;
     short_url?: string;
     size?: number | null;
+    /** Stable id of the item: does not change when it is renamed or moved */
+    file_id?: string;
   };
 }
 
@@ -84,6 +86,7 @@ export class YandexDiskWebClient {
   private sk: string | null = null;
   // Disk web host differs for Yandex 360 accounts (disk.360.yandex.ru), detected from redirect
   private origin: string | null = null;
+  private organizationId: string | null = null;
   // Folders still to visit by an interrupted search, kept in memory for continuation
   private walkSessions = new Map<string, { query: string; queue: string[]; expiresAt: number }>();
   private sharedFoldersCache: { items: SharedResource[]; loadedAt: number } | null = null;
@@ -149,6 +152,8 @@ export class YandexDiskWebClient {
     }
     this.sk = match[1];
     this.origin = finalUrl.origin;
+    // Yandex 360 accounts carry their organization id in the page data (the journal needs it)
+    this.organizationId = html.match(/"organizationIds":\["(\d+)"/)?.[1] ?? null;
   }
 
   /**
@@ -490,7 +495,7 @@ export class YandexDiskWebClient {
    * One page of a folder listing together with the raw page size (the folder itself
    * can come back as an extra item, so the item count alone cannot tell the last page).
    */
-  private async listFolderPage(
+  async listFolderPage(
     path: string,
     options?: { amount?: number; offset?: number }
   ): Promise<{ items: SharedResource[]; rawCount: number }> {
@@ -507,6 +512,71 @@ export class YandexDiskWebClient {
       items: result.resources.filter((resource) => resource.id !== folderId),
       rawCount: result.resources.length,
     };
+  }
+
+  /**
+   * Folders touched by the user's own recent changes (from any device or client),
+   * read from the Disk journal. Other people's changes are not in this journal.
+   * @param sinceMs - epoch ms; older events are ignored
+   * @returns internal paths of the folders where something was added, moved or removed
+   */
+  async getJournalFolders(sinceMs: number): Promise<string[]> {
+    if (!this.sk) await this.refreshSession();
+    const orgId = process.env.YANDEX_ORG_ID || this.organizationId;
+    if (!orgId) return [];
+    const folders = new Set<string>();
+    const pageLoadDate = new Date().toISOString();
+    for (let offset = 0; offset < 400; offset += 40) {
+      const result = await this.callModel<{
+        clusters?: { groups?: { events?: { event_date?: string; path?: string; from?: string }[] }[] }[];
+      }>("intapi/journal", {
+        org_id: orgId,
+        vd_hash: null,
+        page_load_date: pageLoadDate,
+        offset,
+        text: "",
+        limit: 40,
+        event_type: "",
+        limit_per_group: 20,
+        counters_date: pageLoadDate,
+      });
+      const events = (result.clusters ?? []).flatMap((cluster) => (cluster.groups ?? []).flatMap((group) => group.events ?? []));
+      if (events.length === 0) break;
+      let isOlderReached = false;
+      for (const event of events) {
+        if (Date.parse(event.event_date ?? "") < sinceMs) {
+          isOlderReached = true;
+          continue;
+        }
+        // Both ends of a move/rename matter: the old parent lost an item, the new one got it
+        for (const path of [event.path, event.from]) {
+          if (path) folders.add(path.replace(/\/+$/, "").replace(/\/[^/]*$/, ""));
+        }
+      }
+      if (isOlderReached) break;
+    }
+    return [...folders].filter(Boolean);
+  }
+
+  /**
+   * Temporary direct download URL of a file.
+   * @param path - internal path of the file
+   */
+  async getDownloadUrl(path: string): Promise<string> {
+    const result = await this.callModel<{ file?: string }>("mpfs/url", { path });
+    if (!result.file) throw new Error("No download URL returned");
+    // The URL comes protocol-relative ("//downloader.disk.yandex.ru/…")
+    return result.file.startsWith("//") ? `https:${result.file}` : result.file;
+  }
+
+  /**
+   * Total size and file count of a folder tree: a cheap change signature (adds,
+   * removals and size changes show up; renames and empty new folders do not).
+   * @param path - internal path of the folder
+   */
+  async getDirSize(path: string): Promise<{ size: number; filesCount: number }> {
+    const result = await this.callModel<{ size?: number; files_count?: number }>("mpfs/dir-size", { path });
+    return { size: result.size ?? 0, filesCount: result.files_count ?? 0 };
   }
 
   /**
