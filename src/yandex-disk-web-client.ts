@@ -287,6 +287,19 @@ export class YandexDiskWebClient {
   }
 
   /**
+   * Start copying a resource; returns the async operation ID.
+   * @param from - internal source path
+   * @param to - internal destination path (full path including the name)
+   * @param overwrite - replace an existing resource at the destination
+   */
+  async copyResource(from: string, to: string, overwrite: boolean = false): Promise<string> {
+    const operations = await this.callModel<BulkOperation[]>("mpfs/bulk-async-copy", {
+      operations: [{ src: from, dst: to, force: overwrite ? 1 : 0 }],
+    });
+    return operations[0].oid;
+  }
+
+  /**
    * Start moving a resource to trash; returns the async operation ID.
    * @param path - internal path of the resource
    */

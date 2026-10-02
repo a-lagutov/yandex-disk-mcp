@@ -6,7 +6,7 @@ MCP-сервер для Яндекс Диска: свои файлы, публи
 
 Требуется **Node.js ≥ 20** (для `login` — **≥ 22**).
 
-## Инструменты (30)
+## Инструменты (31)
 
 ### Вход
 
@@ -50,6 +50,7 @@ MCP-сервер для Яндекс Диска: свои файлы, публи
 | `list_shared_folder` | Содержимое общей папки (до 40 за раз, дальше — `offset`) |
 | `shared_create_folder` | Создать папку |
 | `shared_move` | Переместить / переименовать |
+| `shared_copy` | Копировать (путь назначения как у `shared_move`) ⚠️ проверено только на своём Диске, не на живой общей папке |
 | `shared_delete` | Удалить (в корзину владельца). Корень общей папки удалить нельзя |
 | `shared_upload_file` | Загрузить локальный файл ⚠️ не проверено на живой папке |
 
@@ -177,7 +178,7 @@ docker run -i --rm -e YANDEX_DISK_TOKEN -e YANDEX_SESSION_COOKIE yandex-disk-mcp
 ## Как устроено
 
 - `src/yandex-disk-client.ts` — официальный REST API (`cloud-api.yandex.net/v1/disk`), OAuth-токен.
-- `src/yandex-disk-web-client.ts` — **недокументированный** API веб-версии (`disk.yandex.ru/models-v2`, для аккаунтов Яндекс 360 — `disk.360.yandex.ru`, хост определяется по редиректу), cookie + CSRF-токен `sk` со страницы Диска. Методы: `mpfs/resources`, `mpfs/mkdir`, `mpfs/bulk-async-move`, `mpfs/bulk-async-delete`, `mpfs/bulk-operation-status`, `mpfs/store`. Может сломаться без предупреждения.
+- `src/yandex-disk-web-client.ts` — **недокументированный** API веб-версии (`disk.yandex.ru/models-v2`, для аккаунтов Яндекс 360 — `disk.360.yandex.ru`, хост определяется по редиректу), cookie + CSRF-токен `sk` со страницы Диска. Методы: `mpfs/resources`, `mpfs/mkdir`, `mpfs/bulk-async-move`, `mpfs/bulk-async-copy`, `mpfs/bulk-async-delete`, `mpfs/bulk-operation-status`, `mpfs/store`. Может сломаться без предупреждения.
 - `src/credentials.ts` — хранилище токена и cookie (`credentials.json`, права 600), переменные окружения перекрывают его.
 - `src/cookie-source.ts` — вход и обновление cookie через браузер на Chromium по протоколу DevTools (отдельный профиль), выдача OAuth-токена.
 - `src/login-cli.ts` — то же из терминала: `npm run login`.

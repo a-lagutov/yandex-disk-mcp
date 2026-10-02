@@ -675,6 +675,25 @@ server.tool(
 );
 
 server.tool(
+  "shared_copy",
+  "Copy a file/folder inside shared folders (needs write rights at the destination). " +
+    "'to' is the full new path including the name.",
+  {
+    from: z.string().describe(SHARED_PATH_DESCRIPTION),
+    to: z.string().describe(`${SHARED_PATH_DESCRIPTION} — full destination path`),
+    overwrite: z.boolean().optional().default(false).describe("Overwrite if exists"),
+  },
+  async ({ from, to, overwrite }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const sourcePath = await webClient.resolvePath(from);
+    const destinationPath = await webClient.resolvePath(to);
+    const oid = await webClient.copyResource(sourcePath, destinationPath, overwrite);
+    const state = await webClient.waitForOperation(oid);
+    return operationResult(`Copied: ${from} → ${to}`, state);
+  }
+);
+
+server.tool(
   "shared_delete",
   "Delete a file/folder inside a shared folder (moves it to the owner's trash; needs write rights). " +
     "Requires a session (see `login`).",
