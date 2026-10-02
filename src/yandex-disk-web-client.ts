@@ -7,7 +7,35 @@
  * The API may change without notice.
  */
 
+import { randomUUID } from "node:crypto";
 import { hashLocalFile, openLocalFile, putFile } from "./local-file.js";
+
+/** How long one shared search call may keep fetching pages. */
+const SEARCH_TIME_BUDGET_MS = 30_000;
+/** The server returns 20 items per search page whatever `amount` says. */
+const SEARCH_PAGE_SIZE = 20;
+const SEARCH_MAX_PARALLEL_PAGES = 4;
+/** Limits of the folder walk: simultaneous listings and total folders per call. */
+const WALK_CONCURRENCY = 8;
+const WALK_MAX_FOLDERS = 3000;
+
+/** How long a folder-walk continuation stays valid, and how many are kept. */
+const WALK_SESSION_TTL_MS = 30 * 60_000;
+const WALK_SESSION_MAX = 20;
+
+/** Prefix that marks a folder-walk continuation key (server-search keys are base64). */
+const WALK_KEY_PREFIX = "walk:";
+
+/** Continuation key for "start at this offset" (`dir;;N`), as the server issues it. */
+function makeOffsetKey(offset: number): string {
+  return Buffer.from(`dir;;${offset}`).toString("base64");
+}
+
+/** Offset from an offset-style continuation key; null for time-cursor keys. */
+function parseOffsetKey(iterationKey: string): number | null {
+  const match = Buffer.from(iterationKey, "base64").toString().match(/^dir;;(\d+)$/);
+  return match ? Number(match[1]) : null;
+}
 
 const WEB_ENTRY_URL ="https://disk.yandex.ru/client/disk";
 
@@ -51,6 +79,8 @@ export class YandexDiskWebClient {
   private sk: string | null = null;
   // Disk web host differs for Yandex 360 accounts (disk.360.yandex.ru), detected from redirect
   private origin: string | null = null;
+  // Folders still to visit by an interrupted search, kept in memory for continuation
+  private walkSessions = new Map<string, { query: string; queue: string[]; expiresAt: number }>();
   private sharedFoldersCache: { items: SharedResource[]; loadedAt: number } | null = null;
 
   /**
@@ -189,6 +219,194 @@ export class YandexDiskWebClient {
     });
   }
 
+  // ─── Search ───────────────────────────────────────────
+
+  /**
+   * Run one page of the web client's search (same request as the search box).
+   * The server only searches whole areas: "/disk" (own Disk) or "/aa" (everything
+   * shared with the user); narrowing to one folder is not supported (405).
+   * @param query - text to look for
+   * @param options - search area, page size and the continuation key / offset
+   */
+  async searchResources(
+    query: string,
+    options: { scope: "/disk" | "/aa"; amount?: number; offset?: number; iterationKey?: string }
+  ): Promise<SharedResourcesPage> {
+    return this.callModel<SharedResourcesPage>("mpfs/resources", {
+      sort: "name",
+      order: "1",
+      idContext: `/search/${encodeURIComponent(query)}${options.scope}`,
+      amount: Math.min(Math.max(options.amount ?? 40, 1), 40),
+      offset: options.offset ?? 0,
+      withParent: "1",
+      iteration_key: options.iterationKey ?? null,
+      querySearch: query,
+      scopeSearch: options.scope,
+      sessionIdSearch: { sessionId: `${Date.now()}-${Math.floor(Math.random() * 1e16)}` },
+      with_share: "1",
+    });
+  }
+
+  /**
+   * Search everything shared with the user, optionally limited to one shared folder.
+   * - No folder: the server search, pages fetched in parallel while the continuation
+   *   key is an offset (`dir;;N`); sparse results switch to a time cursor, which is
+   *   sequential only.
+   * - With folder: the server cannot limit the area (405) and scanning its pages for a
+   *   narrow folder is slow, so the folder tree is walked with fast listings instead.
+   * @param query - text to look for
+   * @param options - folder to limit to (user path), wanted hit count, continuation key
+   * @returns hits and the key of the next page (null when exhausted)
+   */
+  async searchShared(
+    query: string,
+    options: { folder?: string; limit: number; iterationKey?: string }
+  ): Promise<{ resources: SharedResource[]; iterationKey: string | null }> {
+    // A walk continuation carries its own folder, so `folder` is not needed with it
+    if (options.folder || options.iterationKey?.startsWith(WALK_KEY_PREFIX)) {
+      return this.searchByWalking(query, options.folder, options.limit, options.iterationKey);
+    }
+    const hits: SharedResource[] = [];
+    let iterationKey: string | null = options.iterationKey ?? null;
+    // The time budget keeps one call bounded; the rest is reachable via the returned key
+    const deadline = Date.now() + SEARCH_TIME_BUDGET_MS;
+    while (hits.length < options.limit && Date.now() < deadline) {
+      const startOffset = iterationKey === null ? 0 : parseOffsetKey(iterationKey);
+      // Offset keys allow several pages at once; a cursor key must go one by one
+      const pageCount =
+        startOffset === null
+          ? 1
+          : Math.min(SEARCH_MAX_PARALLEL_PAGES, Math.ceil((options.limit - hits.length) / SEARCH_PAGE_SIZE));
+      const keys = Array.from({ length: pageCount }, (_, index) =>
+        startOffset === null
+          ? iterationKey ?? undefined
+          : index === 0
+            ? iterationKey ?? undefined
+            : makeOffsetKey(startOffset + index * SEARCH_PAGE_SIZE)
+      );
+      const pages = await Promise.all(
+        keys.map((key) => this.searchResources(query, { scope: "/aa", iterationKey: key }))
+      );
+      iterationKey = null;
+      for (const page of pages) {
+        hits.push(...page.resources);
+        iterationKey = page.iteration_key ?? null;
+        // Pages after a non-offset key were requested with guessed offsets: drop them
+        if (!iterationKey || parseOffsetKey(iterationKey) === null) break;
+      }
+      if (!iterationKey) break;
+    }
+    return { resources: hits, iterationKey };
+  }
+
+  /**
+   * Find resources by name inside one folder by walking its tree (listing is ~20x
+   * faster than the server search). Folders are listed several at a time. When the
+   * time budget or the hit limit stops the walk, the folders not visited yet are kept
+   * in memory and a continuation key is returned.
+   * @param query - case-insensitive substring of the name
+   * @param folder - folder as given by the user (not needed when resuming)
+   * @param limit - stop after this many hits
+   * @param resumeKey - key from an earlier call that was cut short
+   */
+  private async searchByWalking(
+    query: string,
+    folder: string | undefined,
+    limit: number,
+    resumeKey?: string
+  ): Promise<{ resources: SharedResource[]; iterationKey: string | null }> {
+    this.dropExpiredWalkSessions();
+    let queue: string[];
+    if (resumeKey?.startsWith(WALK_KEY_PREFIX)) {
+      const session = this.walkSessions.get(resumeKey);
+      if (!session) {
+        throw new Error("Search continuation expired or unknown — repeat the search");
+      }
+      this.walkSessions.delete(resumeKey);
+      query = session.query;
+      queue = session.queue;
+    } else {
+      queue = [await this.resolvePath(folder!)];
+    }
+
+    const needle = query.toLowerCase();
+    const hits: SharedResource[] = [];
+    const deadline = Date.now() + SEARCH_TIME_BUDGET_MS;
+    let visitedFolders = 0;
+    let activeVisits = 0;
+
+    /** List one folder completely (all pages), record hits, queue subfolders. */
+    const visit = async (folderPath: string): Promise<void> => {
+      for (let offset = 0; ; offset += 40) {
+        const { items, rawCount } = await this.listFolderPage(folderPath, { amount: 40, offset });
+        for (const item of items) {
+          if (item.name.toLowerCase().includes(needle)) hits.push(item);
+          if (item.type === "dir") queue.push(item.path.replace(/\/+$/, ""));
+        }
+        if (rawCount < 40) break;
+      }
+    };
+
+    // Worker pool instead of fixed batches: a slow listing must not stall the others
+    const worker = async (): Promise<void> => {
+      while (hits.length < limit && visitedFolders < WALK_MAX_FOLDERS && Date.now() < deadline) {
+        const folderPath = queue.shift();
+        if (folderPath === undefined) {
+          // Queue may refill while other workers still list folders
+          if (activeVisits === 0) return;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          continue;
+        }
+        visitedFolders++;
+        activeVisits++;
+        try {
+          await visit(folderPath);
+        } catch (error) {
+          // Keep the folder for the continuation instead of losing it with the error
+          queue.unshift(folderPath);
+          throw error;
+        } finally {
+          activeVisits--;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: WALK_CONCURRENCY }, worker));
+
+    if (queue.length === 0) return { resources: hits, iterationKey: null };
+    const key = `${WALK_KEY_PREFIX}${randomUUID()}`;
+    this.walkSessions.set(key, { query, queue, expiresAt: Date.now() + WALK_SESSION_TTL_MS });
+    // Oldest sessions go first when too many searches were left unfinished
+    while (this.walkSessions.size > WALK_SESSION_MAX) {
+      this.walkSessions.delete(this.walkSessions.keys().next().value!);
+    }
+    return { resources: hits, iterationKey: key };
+  }
+
+  /** Forget continuations nobody came back for. */
+  private dropExpiredWalkSessions(): void {
+    const now = Date.now();
+    for (const [key, session] of this.walkSessions) {
+      if (session.expiresAt < now) this.walkSessions.delete(key);
+    }
+  }
+
+  /**
+   * Convert an internal path to the readable form used by the tools:
+   * "/aa/d_…/Tasks" → "ADV Team 2/Tasks", "/disk/a/b" → "disk:/a/b".
+   * @param internalPath - path as returned by the web API
+   */
+  async toDisplayPath(internalPath: string): Promise<string> {
+    if (internalPath.startsWith("/disk")) return `disk:${internalPath.slice("/disk".length) || "/"}`;
+    const folders = await this.getAllSharedFolders();
+    const root = folders.find(
+      (folder) =>
+        internalPath === folder.path.replace(/\/+$/, "") ||
+        internalPath.startsWith(`${folder.path.replace(/\/+$/, "")}/`)
+    );
+    if (!root) return internalPath;
+    return `${root.name.trim()}${internalPath.slice(root.path.replace(/\/+$/, "").length)}`;
+  }
+
   // ─── Paths inside shared folders ──────────────────────
 
   /**
@@ -253,6 +471,17 @@ export class YandexDiskWebClient {
     path: string,
     options?: { amount?: number; offset?: number }
   ): Promise<SharedResource[]> {
+    return (await this.listFolderPage(path, options)).items;
+  }
+
+  /**
+   * One page of a folder listing together with the raw page size (the folder itself
+   * can come back as an extra item, so the item count alone cannot tell the last page).
+   */
+  private async listFolderPage(
+    path: string,
+    options?: { amount?: number; offset?: number }
+  ): Promise<{ items: SharedResource[]; rawCount: number }> {
     const folderId = `${path}/`;
     const result = await this.callModel<{ resources: SharedResource[] }>("mpfs/resources", {
       idContext: folderId,
@@ -262,7 +491,10 @@ export class YandexDiskWebClient {
       offset: options?.offset ?? 0,
     });
     // The folder itself may come back as the first item — keep only children
-    return result.resources.filter((resource) => resource.id !== folderId);
+    return {
+      items: result.resources.filter((resource) => resource.id !== folderId),
+      rawCount: result.resources.length,
+    };
   }
 
   /**
