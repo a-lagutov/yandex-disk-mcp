@@ -26,6 +26,11 @@ const WALK_SESSION_MAX = 20;
 /** Prefix that marks a folder-walk continuation key (server-search keys are base64). */
 const WALK_KEY_PREFIX = "walk:";
 
+/** Lower-cased query without the double quotes used for whole-word server search. */
+function plainNeedle(query: string): string {
+  return query.replace(/"/g, "").toLowerCase();
+}
+
 /** Continuation key for "start at this offset" (`dir;;N`), as the server issues it. */
 function makeOffsetKey(offset: number): string {
   return Buffer.from(`dir;;${offset}`).toString("base64");
@@ -255,12 +260,14 @@ export class YandexDiskWebClient {
    * - With folder: the server cannot limit the area (405) and scanning its pages for a
    *   narrow folder is slow, so the folder tree is walked with fast listings instead.
    * @param query - text to look for
-   * @param options - folder to limit to (user path), wanted hit count, continuation key
+   * @param options - folder to limit to (user path), wanted hit count, continuation key,
+   *   `exactName` to keep only items whose name contains the query (the server search is
+   *   fuzzy and also matches paths and similar words)
    * @returns hits and the key of the next page (null when exhausted)
    */
   async searchShared(
     query: string,
-    options: { folder?: string; limit: number; iterationKey?: string }
+    options: { folder?: string; limit: number; iterationKey?: string; exactName?: boolean }
   ): Promise<{ resources: SharedResource[]; iterationKey: string | null }> {
     // A walk continuation carries its own folder, so `folder` is not needed with it
     if (options.folder || options.iterationKey?.startsWith(WALK_KEY_PREFIX)) {
@@ -289,7 +296,12 @@ export class YandexDiskWebClient {
       );
       iterationKey = null;
       for (const page of pages) {
-        hits.push(...page.resources);
+        hits.push(
+          ...page.resources.filter(
+            (resource) =>
+              !options.exactName || resource.name.toLowerCase().includes(plainNeedle(query))
+          )
+        );
         iterationKey = page.iteration_key ?? null;
         // Pages after a non-offset key were requested with guessed offsets: drop them
         if (!iterationKey || parseOffsetKey(iterationKey) === null) break;
@@ -329,7 +341,7 @@ export class YandexDiskWebClient {
       queue = [await this.resolvePath(folder!)];
     }
 
-    const needle = query.toLowerCase();
+    const needle = plainNeedle(query);
     const hits: SharedResource[] = [];
     const deadline = Date.now() + SEARCH_TIME_BUDGET_MS;
     let visitedFolders = 0;

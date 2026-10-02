@@ -440,6 +440,11 @@ server.tool(
     "Name search needs a session (see `login`) and ignores media_type/sort.",
   {
     query: z.string().optional().describe("Text to look for in names; omit to list all files"),
+    exact: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("With query: keep only items whose name contains it (the server search is fuzzy)"),
     limit: z.number().optional().default(20).describe("Max items"),
     offset: z.number().optional().default(0).describe("Offset"),
     media_type: z
@@ -453,12 +458,15 @@ server.tool(
       .optional()
       .describe("Sort: name, path, created, modified, size (prefix '-' for desc)"),
   },
-  async ({ query, limit, offset, media_type, sort }) => {
+  async ({ query, exact, limit, offset, media_type, sort }) => {
     if (query) {
       // The REST API has no name search; the web client's search box does
       const page = await webClient.searchResources(query, { scope: "/disk", amount: limit, offset });
-      if (page.resources.length === 0) return textResult(`Nothing found for "${query}".`);
-      const lines = await Promise.all(page.resources.map(formatSearchHit));
+      const found = exact
+        ? page.resources.filter((resource) => resource.name.toLowerCase().includes(query.toLowerCase()))
+        : page.resources;
+      if (found.length === 0) return textResult(`Nothing found for "${query}" in this page (offset ${offset}).`);
+      const lines = await Promise.all(found.map(formatSearchHit));
       return textResult([`🔎 "${query}" (showing ${lines.length}, offset ${offset}):`, "", ...lines].join("\n"));
     }
     const result = await client.getFlatFileList({ limit, offset, media_type, sort });
@@ -663,19 +671,34 @@ server.tool(
     "shared folder or subfolder). Requires a session (see `login`). A call stops after about 30 s: " +
     "pass `iteration_key` from the answer to continue (the folder is remembered).",
   {
-    query: z.string().describe("Text to look for in names"),
+    query: z
+      .string()
+      .describe(
+        "Text to look for in names. In double quotes (\"PROD-9514\") the server matches whole words " +
+          "only: about 5x faster pages and no noise, but it misses names that merely start with " +
+          "it (PROD-9514_out)"
+      ),
     folder: z
       .string()
       .optional()
       .describe(`Limit to one shared folder or subfolder. ${SHARED_PATH_DESCRIPTION}`),
     limit: z.number().optional().default(20).describe("Wanted number of hits (may return a bit more)"),
+    exact: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Keep only items whose name contains the query (case-insensitive); the server search is " +
+          "fuzzy and also returns similar words and items matched by path"
+      ),
     iteration_key: z.string().optional().describe("Continuation key from the previous answer"),
   },
-  async ({ query, folder, limit, iteration_key }) => {
+  async ({ query, folder, limit, exact, iteration_key }) => {
     if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
     const { resources, iterationKey } = await webClient.searchShared(query, {
       folder,
       limit,
+      exactName: exact,
       iterationKey: iteration_key,
     });
     if (resources.length === 0) {
