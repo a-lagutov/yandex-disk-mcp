@@ -822,7 +822,8 @@ server.tool(
   async ({ path }) => {
     if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
     const internalPath = await webClient.resolvePath(path);
-    await webClient.createFolder(internalPath);
+    // Creates missing parents too and tolerates existing folders
+    await webClient.ensureFolder(internalPath);
     return textResult(`✅ Folder created: ${path}`);
   }
 );
@@ -867,21 +868,36 @@ server.tool(
 
 server.tool(
   "shared_delete",
-  "Delete a file/folder inside a shared folder (moves it to the owner's trash; needs write rights). " +
+  "Delete files/folders inside a shared folder (moves them to the owner's trash; needs write rights). " +
+    "Pass several paths in `paths` to delete them all in ONE bulk request instead of one call each. " +
     "Requires a session (see `login`).",
   {
-    path: z.string().describe(SHARED_PATH_DESCRIPTION),
+    path: z.string().optional().describe(`${SHARED_PATH_DESCRIPTION} — single item`),
+    paths: z
+      .array(z.string())
+      .optional()
+      .describe("Several items to delete in one bulk request (same path format as `path`)"),
   },
-  async ({ path }) => {
+  async ({ path, paths }) => {
     if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
-    const internalPath = await webClient.resolvePath(path);
+    const requested = [...(paths ?? []), ...(path ? [path] : [])];
+    if (requested.length === 0) return textResult("❌ Give `path` or `paths`");
+    // Resolve all paths in parallel (resolving only reads the cached folder list)
+    const internalPaths = await Promise.all(requested.map((item) => webClient.resolvePath(item)));
     // Refuse to delete a whole shared folder root — too destructive for a path typo
-    if (/^\/aa\/[^/]+$/.test(internalPath)) {
-      return textResult(`❌ Refusing to delete the shared folder root itself: ${path}`);
+    const rootIndex = internalPaths.findIndex((item) => /^\/aa\/[^/]+$/.test(item));
+    if (rootIndex !== -1) {
+      return textResult(`❌ Refusing to delete the shared folder root itself: ${requested[rootIndex]}`);
     }
-    const oid = await webClient.deleteResource(internalPath);
-    const state = await webClient.waitForOperation(oid);
-    return operationResult(`Moved to trash: ${path}`, state);
+    const oids = await webClient.deleteResources(internalPaths);
+    const outcome = await webClient.waitForOperations(oids);
+    if (outcome.failed === 0 && outcome.pending === 0) {
+      return textResult(`🗑️ Moved to trash: ${requested.length === 1 ? requested[0] : `${requested.length} items`}`);
+    }
+    return textResult(
+      `Deleting ${requested.length} items: ${outcome.done} done, ${outcome.failed} failed, ` +
+        `${outcome.pending} still in progress`
+    );
   }
 );
 
@@ -905,6 +921,35 @@ server.tool(
     const result = await webClient.uploadFile(local_path, internalPath, overwrite);
     const note = result === "hardlinked" ? " (identical content already on Disk, linked instantly)" : "";
     return textResult(`⬆️ Uploaded: ${local_path} → ${destination}${note}`);
+  }
+);
+
+server.tool(
+  "shared_upload_folder",
+  "Upload a whole local folder (recursively) into a shared folder in ONE call: subfolders are " +
+    "created level by level, files upload in parallel. Prefer this over many shared_upload_file / " +
+    "shared_create_folder calls.",
+  {
+    local_dir: z.string().describe("Absolute path of the local folder, e.g. '/Users/me/photos'"),
+    path: z
+      .string()
+      .describe(
+        `${SHARED_PATH_DESCRIPTION} — destination folder; its contents get the local folder's contents`
+      ),
+    overwrite: z.boolean().optional().default(false).describe("Overwrite existing files"),
+  },
+  async ({ local_dir, path, overwrite }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const internalPath = await webClient.resolvePath(path);
+    const result = await webClient.uploadFolder(local_dir, internalPath, overwrite);
+    const lines = [
+      `⬆️ ${local_dir} → ${path}: ${result.uploaded + result.hardlinked} files uploaded ` +
+        `(${result.hardlinked} linked instantly), ${result.folders} subfolders, ${result.failed.length} failed`,
+      // A flood of identical errors helps nobody: show the first few only
+      ...result.failed.slice(0, 10).map((failure) => `❌ ${failure}`),
+      ...(result.failed.length > 10 ? [`… and ${result.failed.length - 10} more failures`] : []),
+    ];
+    return textResult(lines.join("\n"));
   }
 );
 
