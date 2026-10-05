@@ -54,6 +54,27 @@ export function resolveDestinationPath(destination: string, fileName: string): s
 }
 
 /**
+ * Run an async task for every item with at most `concurrency` tasks at once.
+ * @param items - work items
+ * @param concurrency - max simultaneous tasks
+ * @param task - async handler; a rejection stops the pool
+ */
+export async function runPool<T>(
+  items: T[],
+  concurrency: number,
+  task: (item: T) => Promise<void>
+): Promise<void> {
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    // Single-threaded JS: reading and bumping nextIndex is atomic between awaits
+    while (nextIndex < items.length) {
+      await task(items[nextIndex++]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+}
+
+/**
  * Upload file contents with HTTP PUT to a pre-signed upload URL.
  * @param uploadUrl - URL returned by the Disk API
  * @param file - opened local file

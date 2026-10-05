@@ -52,8 +52,9 @@ Requires **Node.js ≥ 20** (**≥ 22** for `login`).
 | `shared_create_folder` | Create a folder |
 | `shared_move` | Move / rename |
 | `shared_copy` | Copy (same destination rules as `shared_move`) |
-| `shared_delete` | Delete (to the owner's trash). A shared folder root cannot be deleted |
+| `shared_delete` | Delete (to the owner's trash). A shared folder root cannot be deleted (several paths in one bulk call) |
 | `shared_upload_file` | Upload a local file |
+| `shared_upload_folder` | Upload a whole local folder (parallel) |
 | `index_shared` | Build a local name index of a shared folder's whole tree in the background (minutes for big trees). Afterwards `shared_search` with that folder answers instantly, ignoring case and punctuation (`prod9514` finds `PROD-9514`). On an indexed folder it runs a cheap update instead (`refresh=true` rebuilds from scratch). See [Index](#index) |
 | `index_status` | Running builds and saved indexes, folder sync state |
 | `index_sync` | Sync indexes through the indexed folders now (runs by itself too, see Limitations) |

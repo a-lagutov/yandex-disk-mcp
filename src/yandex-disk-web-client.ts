@@ -8,7 +8,22 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { hashLocalFile, openLocalFile, putFile } from "./local-file.js";
+import { readdir } from "node:fs/promises";
+import { join, relative, sep } from "node:path";
+import { hashLocalFile, openLocalFile, putFile, runPool } from "./local-file.js";
+
+/**
+ * Simultaneous uploads / folder creations during a folder upload. Measured on 960 small
+ * files: 8 → 5.8 files/s, 16 → 11.4, 32 → 14.5, 64 → 15.2; 128+ gets slower (retries),
+ * and unlimited parallelism fails ~97% with "fetch failed". 32 is the start of the plateau.
+ */
+const UPLOAD_CONCURRENCY = Number(process.env.YANDEX_UPLOAD_CONCURRENCY ?? 32);
+/** Max items per bulk-async-delete / bulk-operation-status request (measured: 40 passes, 45 is rejected). */
+const DELETE_BATCH_SIZE = 40;
+/** Simultaneous delete batches. */
+const DELETE_BATCH_CONCURRENCY = 8;
+/** Attempts per file for transient network errors, with growing pauses between them. */
+const UPLOAD_ATTEMPTS = 4;
 
 /** How long one shared search call may keep fetching pages. */
 const SEARCH_TIME_BUDGET_MS = 30_000;
@@ -588,6 +603,110 @@ export class YandexDiskWebClient {
   }
 
   /**
+   * Create a folder and all its missing parents; folders that already exist are skipped.
+   * @param path - internal path of the folder
+   */
+  async ensureFolder(path: string): Promise<void> {
+    const segments = path.split("/").filter(Boolean);
+    // "/aa/<id>" (shared folder root) and "/disk" always exist and cannot be created
+    const existingDepth = segments[0] === "aa" ? 2 : 1;
+    for (let depth = existingDepth + 1; depth <= segments.length; depth++) {
+      await this.createFolderIfMissing("/" + segments.slice(0, depth).join("/"));
+    }
+  }
+
+  /**
+   * Create one folder, ignoring the "already exists" error.
+   * @param path - internal path of the folder
+   */
+  private async createFolderIfMissing(path: string): Promise<void> {
+    try {
+      await this.createFolder(path);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/exist|409|already/i.test(message)) throw error;
+    }
+  }
+
+  /**
+   * Upload a whole local folder: create all subfolders (level by level, each
+   * level in parallel), then upload files in parallel.
+   * @param localDir - absolute path of the local folder
+   * @param destination - internal path of the target folder (created if missing)
+   * @param overwrite - replace existing files
+   * @returns counts and per-file failures
+   */
+  async uploadFolder(
+    localDir: string,
+    destination: string,
+    overwrite: boolean = false
+  ): Promise<{ uploaded: number; hardlinked: number; folders: number; failed: string[] }> {
+    const entries = await readdir(localDir, { recursive: true, withFileTypes: true });
+    const relativeDirs: string[] = [];
+    const relativeFiles: string[] = [];
+    for (const entry of entries) {
+      const relativePath = join(relative(localDir, entry.parentPath), entry.name);
+      if (entry.isDirectory()) relativeDirs.push(relativePath);
+      else if (entry.isFile()) relativeFiles.push(relativePath);
+    }
+
+    const target = destination.replace(/\/+$/, "");
+    await this.ensureFolder(target);
+
+    // Parents before children: group by depth, create each level in parallel
+    const dirsByDepth = new Map<number, string[]>();
+    for (const dir of relativeDirs) {
+      const depth = dir.split(sep).length;
+      dirsByDepth.set(depth, [...(dirsByDepth.get(depth) ?? []), dir]);
+    }
+    const depths = [...dirsByDepth.keys()].sort((first, second) => first - second);
+    for (const depth of depths) {
+      await runPool(dirsByDepth.get(depth)!, UPLOAD_CONCURRENCY, (dir) =>
+        this.createFolderIfMissing(`${target}/${dir.split(sep).join("/")}`)
+      );
+    }
+
+    const result = { uploaded: 0, hardlinked: 0, folders: relativeDirs.length, failed: [] as string[] };
+    await runPool(relativeFiles, UPLOAD_CONCURRENCY, async (file) => {
+      try {
+        const outcome = await this.uploadFileWithRetry(
+          join(localDir, file),
+          `${target}/${file.split(sep).join("/")}`,
+          overwrite
+        );
+        result[outcome]++;
+      } catch (error) {
+        result.failed.push(`${file}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+    return result;
+  }
+
+  /**
+   * uploadFile with retries on transient network errors ("fetch failed", timeouts, 429/5xx).
+   * @param localPath - absolute path of the local file
+   * @param path - internal destination path including the file name
+   * @param overwrite - replace an existing file at the destination
+   */
+  private async uploadFileWithRetry(
+    localPath: string,
+    path: string,
+    overwrite: boolean
+  ): Promise<"uploaded" | "hardlinked"> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.uploadFile(localPath, path, overwrite);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const isTransient = /fetch failed|ECONN|ETIMEDOUT|socket|429|50\d/i.test(message);
+        if (!isTransient || attempt >= UPLOAD_ATTEMPTS) throw error;
+        // Backoff with jitter so retries do not hit the server in lockstep
+        await new Promise((resolve) => setTimeout(resolve, attempt * 500 + Math.random() * 500));
+      }
+    }
+  }
+
+  /**
    * Start moving/renaming a resource; returns the async operation ID.
    * @param from - internal source path
    * @param to - internal destination path (full path including the new name)
@@ -622,6 +741,27 @@ export class YandexDiskWebClient {
       operations: [{ src: path }],
     });
     return operations[0].oid;
+  }
+
+  /**
+   * Start moving many resources to trash; returns one operation ID per path (same order).
+   * The API rejects more than DELETE_BATCH_SIZE items per request ("Too many items"),
+   * so paths go out in batches, several batches in parallel.
+   * @param paths - internal paths of the resources
+   */
+  async deleteResources(paths: string[]): Promise<string[]> {
+    const batches: string[][] = [];
+    for (let index = 0; index < paths.length; index += DELETE_BATCH_SIZE) {
+      batches.push(paths.slice(index, index + DELETE_BATCH_SIZE));
+    }
+    const oidsByBatch: string[][] = new Array(batches.length);
+    await runPool(batches.map((batch, index) => ({ batch, index })), DELETE_BATCH_CONCURRENCY, async ({ batch, index }) => {
+      const operations = await this.callModel<BulkOperation[]>("mpfs/bulk-async-delete", {
+        operations: batch.map((path) => ({ src: path })),
+      });
+      oidsByBatch[index] = operations.map((operation) => operation.oid);
+    });
+    return oidsByBatch.flat();
   }
 
   /**
@@ -685,6 +825,48 @@ export class YandexDiskWebClient {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     return "in-progress";
+  }
+
+  /**
+   * Poll many async operations together (one status request per round) until all finish.
+   * @param oids - operation IDs from a bulk-async-* call
+   * @param timeoutMs - how long to wait before giving up
+   * @returns counts of finished, failed and still running operations
+   */
+  async waitForOperations(
+    oids: string[],
+    timeoutMs: number = 30_000
+  ): Promise<{ done: number; failed: number; pending: number }> {
+    const deadline = Date.now() + timeoutMs;
+    const finished = new Map<string, "done" | "failed">();
+    while (finished.size < oids.length) {
+      const waiting = oids.filter((oid) => !finished.has(oid));
+      // The status method has the same per-request item limit as the bulk start methods
+      const statuses: Record<string, BulkOperationStatus> = {};
+      const oidBatches: string[][] = [];
+      for (let index = 0; index < waiting.length; index += DELETE_BATCH_SIZE) {
+        oidBatches.push(waiting.slice(index, index + DELETE_BATCH_SIZE));
+      }
+      await runPool(oidBatches, DELETE_BATCH_CONCURRENCY, async (batch) => {
+        Object.assign(
+          statuses,
+          await this.callModel<Record<string, BulkOperationStatus>>("mpfs/bulk-operation-status", {
+            oids: batch,
+          })
+        );
+      });
+      for (const oid of waiting) {
+        const status = statuses[oid];
+        if (status?.status === "DONE" || status?.state === "COMPLETED") finished.set(oid, "done");
+        else if (status?.status === "FAILED" || status?.state === "FAILED" || status?.error) {
+          finished.set(oid, "failed");
+        }
+      }
+      if (finished.size >= oids.length || Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    const failed = [...finished.values()].filter((state) => state === "failed").length;
+    return { done: finished.size - failed, failed, pending: oids.length - finished.size };
   }
 }
 
