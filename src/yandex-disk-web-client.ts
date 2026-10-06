@@ -744,6 +744,28 @@ export class YandexDiskWebClient {
   }
 
   /**
+   * Make a resource public and return its short link (idempotent: an already
+   * public resource returns the same link).
+   * @param path - internal path of the file or folder
+   */
+  async publishResource(path: string): Promise<string> {
+    const result = await this.callModel<{ short_url?: string; url?: string }>("mpfs/set-public", {
+      path,
+    });
+    const link = result.short_url ?? result.url;
+    if (!link) throw new Error("mpfs/set-public returned no link");
+    return link;
+  }
+
+  /**
+   * Make a resource private again (the public link stops working).
+   * @param path - internal path of the file or folder
+   */
+  async unpublishResource(path: string): Promise<void> {
+    await this.callModel<Record<string, never>>("mpfs/set-private", { path });
+  }
+
+  /**
    * Start moving many resources to trash; returns one operation ID per path (same order).
    * The API rejects more than DELETE_BATCH_SIZE items per request ("Too many items"),
    * so paths go out in batches, several batches in parallel.
