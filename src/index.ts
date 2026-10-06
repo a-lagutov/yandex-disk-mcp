@@ -902,6 +902,62 @@ server.tool(
 );
 
 server.tool(
+  "shared_publish",
+  "Create a public link for files/folders inside a shared folder (needs write rights). " +
+    "Pass several paths in `paths` to get all links in one call. Already public items return " +
+    "their existing link.",
+  {
+    path: z.string().optional().describe(`${SHARED_PATH_DESCRIPTION} — single item`),
+    paths: z.array(z.string()).optional().describe("Several items, same path format as `path`"),
+  },
+  async ({ path, paths }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const requested = [...(paths ?? []), ...(path ? [path] : [])];
+    if (requested.length === 0) return textResult("❌ Give `path` or `paths`");
+    const lines: string[] = new Array(requested.length);
+    // Independent requests: run them in parallel, keep the order of the input
+    await Promise.all(
+      requested.map(async (item, index) => {
+        try {
+          const link = await webClient.publishResource(await webClient.resolvePath(item));
+          lines[index] = `🔗 ${item} — ${link}`;
+        } catch (error) {
+          lines[index] = `❌ ${item}: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      })
+    );
+    return textResult(lines.join("\n"));
+  }
+);
+
+server.tool(
+  "shared_unpublish",
+  "Remove the public link of files/folders inside a shared folder (needs write rights). " +
+    "Pass several paths in `paths` to do it in one call.",
+  {
+    path: z.string().optional().describe(`${SHARED_PATH_DESCRIPTION} — single item`),
+    paths: z.array(z.string()).optional().describe("Several items, same path format as `path`"),
+  },
+  async ({ path, paths }) => {
+    if (!webClient) return textResult(MISSING_COOKIE_MESSAGE);
+    const requested = [...(paths ?? []), ...(path ? [path] : [])];
+    if (requested.length === 0) return textResult("❌ Give `path` or `paths`");
+    const lines: string[] = new Array(requested.length);
+    await Promise.all(
+      requested.map(async (item, index) => {
+        try {
+          await webClient.unpublishResource(await webClient.resolvePath(item));
+          lines[index] = `🔒 ${item}`;
+        } catch (error) {
+          lines[index] = `❌ ${item}: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      })
+    );
+    return textResult(lines.join("\n"));
+  }
+);
+
+server.tool(
   "shared_upload_file",
   "Upload a local file into a shared folder (needs write rights). Uses the undocumented " +
     "web API (mpfs/store).",
